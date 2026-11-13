@@ -6,9 +6,10 @@ import java.util.List;
 import java.util.Random;
 
 /**
- * Pure-Java Snake game engine (zero Android dependencies for full JVM testability).
- * Supports 3 modes (Classic, Portal/Wrap, Obstacles with BFS reachability verification),
- * 3 speeds with progressive acceleration, 2-step turn queue, golden bonus fruit, and combos.
+ * Pure-Java Snake v2 game engine (zero Android dependencies for full JVM testability).
+ * Supports 6 game modes (Classic, No-Walls, Obstacles, Maze, Wormhole, Time Blitz),
+ * 3 speed levels, 2-step turn queue, golden bonus stars, combos, and 3 power-up orbs
+ * (Shield, Slow-Mo, 2x Score).
  */
 public final class GameEngine {
     public static final int COLS = 17;
@@ -17,6 +18,10 @@ public final class GameEngine {
     public static final int MODE_CLASSIC = 0;
     public static final int MODE_PORTAL = 1;
     public static final int MODE_OBSTACLES = 2;
+    public static final int MODE_MAZE = 3;
+    public static final int MODE_WORMHOLE = 4;
+    public static final int MODE_BLITZ = 5;
+    public static final int MODE_COUNT = 6;
 
     public static final int SPEED_SLOW = 0;
     public static final int SPEED_NORMAL = 1;
@@ -32,8 +37,18 @@ public final class GameEngine {
     public static final int DIR_DOWN = 2;
     public static final int DIR_LEFT = 3;
 
+    public static final int POWER_NONE = 0;
+    public static final int POWER_SHIELD = 1;
+    public static final int POWER_SLOW = 2;
+    public static final int POWER_DOUBLE = 3;
+
     public static final float BONUS_DURATION_SEC = 7.5f;
+    public static final float POWERUP_SPAWN_LIFETIME_SEC = 9.0f;
+    public static final float SLOW_EFFECT_SEC = 6.5f;
+    public static final float DOUBLE_EFFECT_SEC = 8.5f;
     public static final float COMBO_WINDOW_SEC = 4.2f;
+    public static final float BLITZ_INITIAL_SEC = 60.0f;
+    public static final float BLITZ_MAX_SEC = 99.0f;
 
     public static final class Cell {
         public final int x;
@@ -54,16 +69,19 @@ public final class GameEngine {
     }
 
     public interface Listener {
-        void onEatFood(int cellX, int cellY, int pointsAwarded, int comboCount);
-        void onEatBonus(int cellX, int cellY, int pointsAwarded);
+        void onEatFood(int cellX, int cellY, int pointsAwarded, int comboCount, boolean doubled);
+        void onEatBonus(int cellX, int cellY, int pointsAwarded, boolean doubled);
+        void onCollectPowerUp(int cellX, int cellY, int powerType);
+        void onShieldSave(int cellX, int cellY);
+        void onPortalWarp(int fromX, int fromY, int toX, int toY);
         void onTurn();
-        void onGameOver(boolean won, boolean newBest);
+        void onGameOver(boolean won, boolean timeUp, boolean newBest);
     }
 
     private final Random random;
     private final List<Cell> snake = new ArrayList<Cell>(COLS * ROWS);
     private final List<Cell> prevSnake = new ArrayList<Cell>(COLS * ROWS);
-    private final List<Cell> obstacles = new ArrayList<Cell>(24);
+    private final List<Cell> obstacles = new ArrayList<Cell>(64);
     private final boolean[][] obstacleGrid = new boolean[COLS][ROWS];
     private final int[] turnQueue = new int[2];
     private int turnQueueCount = 0;
@@ -77,14 +95,34 @@ public final class GameEngine {
     private Cell bonusFood;
     private float bonusTimeLeft = 0f;
 
+    // Power-up pickup on board
+    private Cell powerUpCell;
+    private int powerUpType = POWER_NONE;
+    private float powerUpBoardTimeLeft = 0f;
+
+    // Active player power-up effects
+    private boolean shieldActive = false;
+    private float slowTimeLeft = 0f;
+    private float doubleTimeLeft = 0f;
+
+    // Wormhole twin portals (MODE_WORMHOLE)
+    private Cell portalA;
+    private Cell portalB;
+    private int portalWarpCount = 0;
+    private boolean pendingPortalRelocate = false;
+
+    // Time Blitz mode countdown (MODE_BLITZ)
+    private float blitzTimeLeft = 0f;
+
     private int score = 0;
     private int applesEaten = 0;
     private int comboCount = 0;
     private float comboTimer = 0f;
     private boolean wonBoard = false;
+    private boolean timeExpired = false;
     private boolean newBestThisRun = false;
 
-    private final int[] bestScores = new int[3];
+    private final int[] bestScores = new int[MODE_COUNT];
     private float tickAccumulator = 0f;
     private Listener listener;
 
@@ -124,16 +162,39 @@ public final class GameEngine {
     public int getApplesEaten() { return applesEaten; }
     public int getComboCount() { return comboCount; }
     public boolean isWonBoard() { return wonBoard; }
+    public boolean isTimeExpired() { return timeExpired; }
     public boolean isNewBestThisRun() { return newBestThisRun; }
+
+    public boolean isWrapWalls() {
+        return mode == MODE_PORTAL
+                || mode == MODE_MAZE
+                || mode == MODE_WORMHOLE
+                || mode == MODE_BLITZ;
+    }
 
     public List<Cell> getSnake() { return snake; }
     public List<Cell> getPrevSnake() { return prevSnake; }
     public List<Cell> getObstacles() { return obstacles; }
     public Cell getFood() { return food; }
     public Cell getBonusFood() { return bonusFood; }
+    public Cell getPowerUpCell() { return powerUpCell; }
+    public int getPowerUpType() { return powerUpType; }
+    public Cell getPortalA() { return portalA; }
+    public Cell getPortalB() { return portalB; }
+
+    public boolean isShieldActive() { return shieldActive; }
+    public float getSlowTimeLeft() { return slowTimeLeft; }
+    public float getDoubleTimeLeft() { return doubleTimeLeft; }
+    public float getBlitzTimeLeft() { return blitzTimeLeft; }
+
     public float getBonusProgress() {
         if (bonusFood == null || bonusTimeLeft <= 0f) return 0f;
         return Math.min(1f, bonusTimeLeft / BONUS_DURATION_SEC);
+    }
+
+    public float getPowerUpBoardProgress() {
+        if (powerUpCell == null || powerUpBoardTimeLeft <= 0f) return 0f;
+        return Math.min(1f, powerUpBoardTimeLeft / POWERUP_SPAWN_LIFETIME_SEC);
     }
 
     public float getTickIntervalSec() {
@@ -145,15 +206,18 @@ public final class GameEngine {
             minMs = 105f;
             stepMs = 1.8f;
         } else if (speedLevel == SPEED_FAST) {
-            baseMs = 105f;
+            baseMs = 104f;
             minMs = 58f;
             stepMs = 1.3f;
         } else {
-            baseMs = 142f;
-            minMs = 76f;
+            baseMs = 140f;
+            minMs = 74f;
             stepMs = 1.6f;
         }
         float ms = Math.max(minMs, baseMs - applesEaten * stepMs);
+        if (slowTimeLeft > 0f) {
+            ms *= 1.48f;
+        }
         return ms / 1000f;
     }
 
@@ -168,7 +232,7 @@ public final class GameEngine {
     }
 
     public void setMode(int newMode) {
-        if (newMode < MODE_CLASSIC || newMode > MODE_OBSTACLES) return;
+        if (newMode < 0 || newMode >= MODE_COUNT) return;
         this.mode = newMode;
         if (state == STATE_MENU) {
             setupPreviewBoard();
@@ -219,7 +283,6 @@ public final class GameEngine {
 
         int cx = COLS / 2;
         int cy = ROWS / 2;
-        // Start with 4 segments heading right in center
         snake.add(new Cell(cx, cy));
         snake.add(new Cell(cx - 1, cy));
         snake.add(new Cell(cx - 2, cy));
@@ -234,34 +297,83 @@ public final class GameEngine {
         comboTimer = 0f;
         bonusFood = null;
         bonusTimeLeft = 0f;
+        powerUpCell = null;
+        powerUpType = POWER_NONE;
+        powerUpBoardTimeLeft = 0f;
+        shieldActive = false;
+        slowTimeLeft = 0f;
+        doubleTimeLeft = 0f;
+        portalA = null;
+        portalB = null;
+        portalWarpCount = 0;
+        pendingPortalRelocate = false;
+        blitzTimeLeft = (mode == MODE_BLITZ) ? BLITZ_INITIAL_SEC : 0f;
         wonBoard = false;
+        timeExpired = false;
         newBestThisRun = false;
         tickAccumulator = 0f;
 
         if (mode == MODE_OBSTACLES) {
             generateSafeObstacles(cx, cy);
+        } else if (mode == MODE_MAZE) {
+            generateMazeObstacles();
+        } else if (mode == MODE_WORMHOLE) {
+            spawnPortalPair();
         }
 
-        food = spawnFreeCell(null);
+        food = spawnFreeCell();
+    }
+
+    private void addObstacle(int x, int y) {
+        if (x < 0 || x >= COLS || y < 0 || y >= ROWS) return;
+        if (!obstacleGrid[x][y]) {
+            obstacleGrid[x][y] = true;
+            obstacles.add(new Cell(x, y));
+        }
+    }
+
+    private void generateMazeObstacles() {
+        // Classic symmetric arcade labyrinth with 4 generous 5-cell wrap gates
+        for (int x = 0; x <= 5; x++) {
+            addObstacle(x, 0);
+            addObstacle(x, ROWS - 1);
+        }
+        for (int x = 11; x < COLS; x++) {
+            addObstacle(x, 0);
+            addObstacle(x, ROWS - 1);
+        }
+        for (int y = 1; y <= 6; y++) {
+            addObstacle(0, y);
+            addObstacle(COLS - 1, y);
+        }
+        for (int y = 12; y <= ROWS - 2; y++) {
+            addObstacle(0, y);
+            addObstacle(COLS - 1, y);
+        }
+        // 4 symmetric interior crystal bars (leaves center snake corridor & cross avenues wide open)
+        for (int x = 4; x <= 6; x++) {
+            addObstacle(x, 4);
+            addObstacle(x, ROWS - 5);
+        }
+        for (int x = 10; x <= 12; x++) {
+            addObstacle(x, 4);
+            addObstacle(x, ROWS - 5);
+        }
     }
 
     private void generateSafeObstacles(int headX, int headY) {
-        // Place symmetric, attractive, guaranteed-reachable obstacle clusters
         int targetCount = 12;
         int attempts = 0;
-        while (obstacles.size() < targetCount && attempts < 250) {
+        while (obstacles.size() < targetCount && attempts < 260) {
             attempts++;
             int ox = 1 + random.nextInt(COLS - 2);
             int oy = 1 + random.nextInt(ROWS - 2);
-
-            // Keep wide safe spawn zone around initial snake and 5 cells ahead of head
             if (oy >= headY - 2 && oy <= headY + 2 && ox >= headX - 5 && ox <= headX + 6) {
                 continue;
             }
             if (obstacleGrid[ox][oy] || isOccupiedBySnake(ox, oy, false)) {
                 continue;
             }
-            // Tentatively place and verify full connectivity + no dead-end pockets
             obstacleGrid[ox][oy] = true;
             if (isBoardFullyReachable(headX, headY) && !createsDeadEnd(ox, oy)) {
                 obstacles.add(new Cell(ox, oy));
@@ -271,8 +383,39 @@ public final class GameEngine {
         }
     }
 
+    private void spawnPortalPair() {
+        portalA = null;
+        portalB = null;
+        List<Cell> candidates = new ArrayList<Cell>();
+        Cell head = snake.isEmpty() ? new Cell(COLS / 2, ROWS / 2) : snake.get(0);
+        for (int x = 2; x < COLS - 2; x++) {
+            for (int y = 2; y < ROWS - 2; y++) {
+                if (obstacleGrid[x][y]) continue;
+                if (isOccupiedBySnake(x, y, false)) continue;
+                if (food != null && food.same(x, y)) continue;
+                if (bonusFood != null && bonusFood.same(x, y)) continue;
+                if (powerUpCell != null && powerUpCell.same(x, y)) continue;
+                // Keep away from immediate head forward cell
+                if (Math.abs(x - head.x) <= 2 && Math.abs(y - head.y) <= 2) continue;
+                candidates.add(new Cell(x, y));
+            }
+        }
+        if (candidates.size() < 2) return;
+        for (int tries = 0; tries < 60; tries++) {
+            Cell a = candidates.get(random.nextInt(candidates.size()));
+            Cell b = candidates.get(random.nextInt(candidates.size()));
+            int dist = Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+            if (dist >= 9) {
+                portalA = a;
+                portalB = b;
+                return;
+            }
+        }
+        portalA = candidates.get(0);
+        portalB = candidates.get(candidates.size() - 1);
+    }
+
     private boolean createsDeadEnd(int ox, int oy) {
-        // Check neighbors of placed obstacle to ensure no free cell has <= 1 open exit
         int[] dx = {0, 1, 0, -1};
         int[] dy = {-1, 0, 1, 0};
         for (int i = 0; i < 4; i++) {
@@ -330,10 +473,6 @@ public final class GameEngine {
                 || (d1 == DIR_RIGHT && d2 == DIR_LEFT);
     }
 
-    /**
-     * Enqueues a player turn safely using a 2-slot turn buffer.
-     * Prevents 180-degree self-reversal even when tapping two directions quickly within 1 tick.
-     */
     public boolean queueDirection(int dir) {
         if (state != STATE_PLAYING) return false;
         if (dir < DIR_UP || dir > DIR_LEFT) return false;
@@ -371,6 +510,31 @@ public final class GameEngine {
             }
         }
 
+        if (powerUpCell != null) {
+            powerUpBoardTimeLeft -= dtSec;
+            if (powerUpBoardTimeLeft <= 0f) {
+                powerUpCell = null;
+                powerUpType = POWER_NONE;
+                powerUpBoardTimeLeft = 0f;
+            }
+        }
+
+        if (slowTimeLeft > 0f) {
+            slowTimeLeft = Math.max(0f, slowTimeLeft - dtSec);
+        }
+        if (doubleTimeLeft > 0f) {
+            doubleTimeLeft = Math.max(0f, doubleTimeLeft - dtSec);
+        }
+
+        if (mode == MODE_BLITZ) {
+            blitzTimeLeft -= dtSec;
+            if (blitzTimeLeft <= 0f) {
+                blitzTimeLeft = 0f;
+                triggerGameOver(false, true);
+                return;
+            }
+        }
+
         tickAccumulator += dtSec;
         float interval = getTickIntervalSec();
         while (tickAccumulator >= interval && state == STATE_PLAYING) {
@@ -380,13 +544,9 @@ public final class GameEngine {
         }
     }
 
-    /**
-     * Executes a single discrete grid step. Exposed package-public for deterministic unit tests.
-     */
     public void stepTick() {
         if (state != STATE_PLAYING) return;
 
-        // Pop next queued turn if available
         if (turnQueueCount > 0) {
             int nextDir = turnQueue[0];
             if (turnQueueCount == 2) {
@@ -399,41 +559,71 @@ public final class GameEngine {
         }
 
         Cell head = snake.get(0);
-        int nx = head.x;
-        int ny = head.y;
-        if (currentDir == DIR_UP) ny--;
-        else if (currentDir == DIR_DOWN) ny++;
-        else if (currentDir == DIR_LEFT) nx--;
-        else if (currentDir == DIR_RIGHT) nx++;
+        int[] next = computeNextCell(head.x, head.y, currentDir);
+        int nx = next[0];
+        int ny = next[1];
+        boolean lethal = isLethalMove(nx, ny);
 
-        // Wall check / Portal wrap
-        if (mode == MODE_PORTAL) {
-            if (nx < 0) nx = COLS - 1;
-            else if (nx >= COLS) nx = 0;
-            if (ny < 0) ny = ROWS - 1;
-            else if (ny >= ROWS) ny = 0;
-        } else {
-            if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) {
-                triggerGameOver(false);
-                return;
+        // Shield Rescue: if about to crash while Shield is active, auto-steer to a safe perpendicular cell!
+        if (lethal && shieldActive) {
+            int escapeDir = findBestEscapeDirection(head.x, head.y, currentDir);
+            if (escapeDir != -1) {
+                shieldActive = false;
+                currentDir = escapeDir;
+                turnQueueCount = 0;
+                next = computeNextCell(head.x, head.y, currentDir);
+                nx = next[0];
+                ny = next[1];
+                lethal = false;
+                if (listener != null) {
+                    listener.onShieldSave(head.x, head.y);
+                }
             }
         }
 
-        // Obstacle collision
-        if (obstacleGrid[nx][ny]) {
-            triggerGameOver(false);
+        if (lethal) {
+            triggerGameOver(false, false);
             return;
+        }
+
+        // Wormhole teleportation check
+        boolean warped = false;
+        int warpFromX = nx, warpFromY = ny;
+        if (mode == MODE_WORMHOLE && portalA != null && portalB != null) {
+            if (portalA.same(nx, ny)) {
+                nx = portalB.x;
+                ny = portalB.y;
+                warped = true;
+            } else if (portalB.same(nx, ny)) {
+                nx = portalA.x;
+                ny = portalA.y;
+                warped = true;
+            }
+            if (warped) {
+                // Check destination not occupied by body (other than vacating tail)
+                if (isOccupiedBySnake(nx, ny, true)) {
+                    if (shieldActive) {
+                        shieldActive = false;
+                        if (listener != null) listener.onShieldSave(warpFromX, warpFromY);
+                    } else {
+                        triggerGameOver(false, false);
+                        return;
+                    }
+                }
+                portalWarpCount++;
+                if (portalWarpCount % 3 == 0) {
+                    pendingPortalRelocate = true;
+                }
+                if (listener != null) {
+                    listener.onPortalWarp(warpFromX, warpFromY, nx, ny);
+                }
+            }
         }
 
         boolean willEatFood = (food != null && food.same(nx, ny));
         boolean willEatBonus = (bonusFood != null && bonusFood.same(nx, ny));
+        boolean willEatPower = (powerUpCell != null && powerUpCell.same(nx, ny));
         boolean willGrow = willEatFood || willEatBonus;
-
-        // Self collision (note: moving onto tail cell is valid if NOT growing on this tick!)
-        if (isOccupiedBySnake(nx, ny, !willGrow)) {
-            triggerGameOver(false);
-            return;
-        }
 
         // Save previous positions for smooth interpolation
         copySnakeToPrev();
@@ -442,13 +632,21 @@ public final class GameEngine {
         snake.add(0, new Cell(nx, ny));
         if (!willGrow) {
             snake.remove(snake.size() - 1);
-        } else {
-            // Keep prevSnake same length by duplicating old tail so new tail interpolates smoothly
-            if (!prevSnake.isEmpty()) {
-                Cell lastPrev = prevSnake.get(prevSnake.size() - 1);
-                prevSnake.add(new Cell(lastPrev.x, lastPrev.y));
-            }
+        } else if (!prevSnake.isEmpty()) {
+            Cell lastPrev = prevSnake.get(prevSnake.size() - 1);
+            prevSnake.add(new Cell(lastPrev.x, lastPrev.y));
         }
+
+        // Safely relocate wormholes once snake has completely exited both portals
+        if (pendingPortalRelocate && portalA != null && portalB != null
+                && !isOccupiedBySnake(portalA.x, portalA.y, false)
+                && !isOccupiedBySnake(portalB.x, portalB.y, false)) {
+            pendingPortalRelocate = false;
+            spawnPortalPair();
+        }
+
+        boolean doubled = (doubleTimeLeft > 0f);
+        int mult = doubled ? 2 : 1;
 
         if (willEatFood) {
             applesEaten++;
@@ -459,35 +657,147 @@ public final class GameEngine {
             }
             comboTimer = COMBO_WINDOW_SEC;
 
-            int pts = 10 + (comboCount >= 3 ? 10 : (comboCount == 2 ? 5 : 0));
+            int basePts = 10 + (comboCount >= 3 ? 10 : (comboCount == 2 ? 5 : 0));
+            if (mode == MODE_MAZE || mode == MODE_OBSTACLES) {
+                basePts += 5; // Extra challenge reward!
+            }
+            int pts = basePts * mult;
             addScore(pts);
 
-            if (listener != null) {
-                listener.onEatFood(nx, ny, pts, comboCount);
+            if (mode == MODE_BLITZ) {
+                blitzTimeLeft = Math.min(BLITZ_MAX_SEC, blitzTimeLeft + 2.0f);
             }
 
-            // Spawn golden bonus every 5 apples if none active
+            if (listener != null) {
+                listener.onEatFood(nx, ny, pts, comboCount, doubled);
+            }
+
+            // Golden bonus star every 5 apples
             if (applesEaten % 5 == 0 && bonusFood == null) {
-                bonusFood = spawnFreeCell(food);
+                bonusFood = spawnFreeCell();
                 if (bonusFood != null) {
                     bonusTimeLeft = BONUS_DURATION_SEC;
                 }
             }
 
-            food = spawnFreeCell(bonusFood);
+            // Power-up orb spawning frequency depends on mode
+            int powerInterval = (mode == MODE_BLITZ) ? 3
+                    : ((mode == MODE_OBSTACLES || mode == MODE_MAZE || mode == MODE_WORMHOLE) ? 4 : 6);
+            if (applesEaten % powerInterval == 0 && powerUpCell == null) {
+                spawnPowerUp();
+            }
+
+            food = spawnFreeCell();
             if (food == null) {
-                // Player filled the entire board!
-                addScore(500);
-                triggerGameOver(true);
+                addScore(500 * mult);
+                triggerGameOver(true, false);
             }
         } else if (willEatBonus) {
             bonusFood = null;
             bonusTimeLeft = 0f;
-            int pts = 30;
+            int pts = 30 * mult;
             addScore(pts);
-            if (listener != null) {
-                listener.onEatBonus(nx, ny, pts);
+            if (mode == MODE_BLITZ) {
+                blitzTimeLeft = Math.min(BLITZ_MAX_SEC, blitzTimeLeft + 5.0f);
             }
+            if (listener != null) {
+                listener.onEatBonus(nx, ny, pts, doubled);
+            }
+        } else if (willEatPower) {
+            int picked = powerUpType;
+            powerUpCell = null;
+            powerUpType = POWER_NONE;
+            powerUpBoardTimeLeft = 0f;
+            applyPowerUp(picked);
+            if (listener != null) {
+                listener.onCollectPowerUp(nx, ny, picked);
+            }
+        }
+    }
+
+    private int[] computeNextCell(int x, int y, int dir) {
+        int nx = x;
+        int ny = y;
+        if (dir == DIR_UP) ny--;
+        else if (dir == DIR_DOWN) ny++;
+        else if (dir == DIR_LEFT) nx--;
+        else if (dir == DIR_RIGHT) nx++;
+
+        if (isWrapWalls()) {
+            if (nx < 0) nx = COLS - 1;
+            else if (nx >= COLS) nx = 0;
+            if (ny < 0) ny = ROWS - 1;
+            else if (ny >= ROWS) ny = 0;
+        }
+        return new int[]{nx, ny};
+    }
+
+    private boolean isLethalMove(int nx, int ny) {
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) {
+            return true;
+        }
+        if (obstacleGrid[nx][ny]) {
+            return true;
+        }
+        boolean willGrow = (food != null && food.same(nx, ny))
+                || (bonusFood != null && bonusFood.same(nx, ny));
+        return isOccupiedBySnake(nx, ny, !willGrow);
+    }
+
+    private int findBestEscapeDirection(int hx, int hy, int dir) {
+        int leftDir = (dir + 3) % 4;
+        int rightDir = (dir + 1) % 4;
+        int[] cand = new int[]{leftDir, rightDir};
+        int bestDir = -1;
+        int bestClearance = -1;
+        for (int i = 0; i < cand.length; i++) {
+            int d = cand[i];
+            int[] p = computeNextCell(hx, hy, d);
+            if (!isLethalMove(p[0], p[1])) {
+                int clearance = countStraightClearance(p[0], p[1], d);
+                if (clearance > bestClearance) {
+                    bestClearance = clearance;
+                    bestDir = d;
+                }
+            }
+        }
+        return bestDir;
+    }
+
+    private int countStraightClearance(int sx, int sy, int dir) {
+        int x = sx, y = sy, count = 1;
+        for (int step = 0; step < 6; step++) {
+            int[] p = computeNextCell(x, y, dir);
+            if (isLethalMove(p[0], p[1])) break;
+            x = p[0];
+            y = p[1];
+            count++;
+        }
+        return count;
+    }
+
+    private void spawnPowerUp() {
+        Cell c = spawnFreeCell();
+        if (c == null) return;
+        int roll = random.nextInt(3);
+        if (roll == 0 && !shieldActive) {
+            powerUpType = POWER_SHIELD;
+        } else if (roll == 1) {
+            powerUpType = POWER_SLOW;
+        } else {
+            powerUpType = POWER_DOUBLE;
+        }
+        powerUpCell = c;
+        powerUpBoardTimeLeft = POWERUP_SPAWN_LIFETIME_SEC;
+    }
+
+    private void applyPowerUp(int type) {
+        if (type == POWER_SHIELD) {
+            shieldActive = true;
+        } else if (type == POWER_SLOW) {
+            slowTimeLeft = SLOW_EFFECT_SEC;
+        } else if (type == POWER_DOUBLE) {
+            doubleTimeLeft = DOUBLE_EFFECT_SEC;
         }
     }
 
@@ -499,12 +809,13 @@ public final class GameEngine {
         }
     }
 
-    private void triggerGameOver(boolean won) {
+    private void triggerGameOver(boolean won, boolean timeUp) {
         wonBoard = won;
+        timeExpired = timeUp;
         state = STATE_GAME_OVER;
         tickAccumulator = 0f;
         if (listener != null) {
-            listener.onGameOver(won, newBestThisRun);
+            listener.onGameOver(won, timeUp, newBestThisRun);
         }
     }
 
@@ -524,12 +835,16 @@ public final class GameEngine {
         return false;
     }
 
-    private Cell spawnFreeCell(Cell avoidExtra) {
+    private Cell spawnFreeCell() {
         List<Cell> free = new ArrayList<Cell>(COLS * ROWS);
         for (int x = 0; x < COLS; x++) {
             for (int y = 0; y < ROWS; y++) {
                 if (obstacleGrid[x][y]) continue;
-                if (avoidExtra != null && avoidExtra.same(x, y)) continue;
+                if (food != null && food.same(x, y)) continue;
+                if (bonusFood != null && bonusFood.same(x, y)) continue;
+                if (powerUpCell != null && powerUpCell.same(x, y)) continue;
+                if (portalA != null && portalA.same(x, y)) continue;
+                if (portalB != null && portalB.same(x, y)) continue;
                 if (isOccupiedBySnake(x, y, false)) continue;
                 free.add(new Cell(x, y));
             }
@@ -538,7 +853,7 @@ public final class GameEngine {
         return free.get(random.nextInt(free.size()));
     }
 
-    // Package helper for testing food placement deterministically
+    // Package test helpers
     void setFoodForTest(int x, int y) {
         this.food = new Cell(x, y);
     }
@@ -546,5 +861,16 @@ public final class GameEngine {
     void setBonusFoodForTest(int x, int y, float durationSec) {
         this.bonusFood = new Cell(x, y);
         this.bonusTimeLeft = durationSec;
+    }
+
+    void setPowerUpForTest(int x, int y, int type) {
+        this.powerUpCell = new Cell(x, y);
+        this.powerUpType = type;
+        this.powerUpBoardTimeLeft = POWERUP_SPAWN_LIFETIME_SEC;
+    }
+
+    void setPortalsForTest(int ax, int ay, int bx, int by) {
+        this.portalA = new Cell(ax, ay);
+        this.portalB = new Cell(bx, by);
     }
 }

@@ -7,7 +7,7 @@ import android.media.AudioTrack;
 
 /**
  * Zero-dependency synthesized retro-modern PCM sound effects engine.
- * Safe across Android API 21-35, runs playback off the UI thread.
+ * Safe across Android API 21-35+, runs playback off the UI thread.
  */
 public final class SoundEngine {
     public static final int SND_EAT = 0;
@@ -16,12 +16,15 @@ public final class SoundEngine {
     public static final int SND_BUTTON = 3;
     public static final int SND_GAME_OVER = 4;
     public static final int SND_NEW_RECORD = 5;
+    public static final int SND_POWERUP = 6;
+    public static final int SND_SHIELD_SAVE = 7;
+    public static final int SND_WARP = 8;
 
     private static final int SAMPLE_RATE = 22050;
 
-    private final short[][] clips = new short[6][];
+    private final short[][] clips = new short[9][];
     private final Object queueLock = new Object();
-    private final int[] queue = new int[8];
+    private final int[] queue = new int[10];
     private int qHead = 0;
     private int qTail = 0;
     private int qCount = 0;
@@ -31,12 +34,15 @@ public final class SoundEngine {
     private Thread workerThread;
 
     public SoundEngine() {
-        clips[SND_EAT] = buildTwoTone(523.25f, 783.99f, 55, 75, 0.34f);
-        clips[SND_BONUS] = buildArpeggio(new float[]{659.25f, 830.61f, 987.77f, 1318.51f}, 55, 0.36f);
-        clips[SND_TURN] = buildTone(340f, 380f, 18, 0.10f);
-        clips[SND_BUTTON] = buildTone(560f, 640f, 28, 0.22f);
-        clips[SND_GAME_OVER] = buildTone(420f, 125f, 360, 0.36f);
+        clips[SND_EAT] = buildTwoTone(523.25f, 783.99f, 52, 72, 0.34f);
+        clips[SND_BONUS] = buildArpeggio(new float[]{659.25f, 830.61f, 987.77f, 1318.51f}, 52, 0.36f);
+        clips[SND_TURN] = buildTone(340f, 385f, 16, 0.09f);
+        clips[SND_BUTTON] = buildTone(560f, 650f, 26, 0.22f);
+        clips[SND_GAME_OVER] = buildTone(420f, 120f, 360, 0.36f);
         clips[SND_NEW_RECORD] = buildArpeggio(new float[]{523.25f, 659.25f, 783.99f, 1046.50f}, 75, 0.38f);
+        clips[SND_POWERUP] = buildArpeggio(new float[]{440f, 659.25f, 880f, 1174.66f}, 45, 0.34f);
+        clips[SND_SHIELD_SAVE] = buildTwoTone(880f, 330f, 65, 110, 0.38f);
+        clips[SND_WARP] = buildTone(280f, 1120f, 165, 0.30f);
 
         workerThread = new Thread(new Runnable() {
             @Override
@@ -124,7 +130,7 @@ public final class SoundEngine {
                 }
             }
         } catch (Throwable ignored) {
-            // Silently disable sound if audio hardware is unavailable
+            // Silently disable audio if hardware is unavailable
         } finally {
             if (track != null) {
                 try {
@@ -147,9 +153,7 @@ public final class SoundEngine {
             float t = i / (float) Math.max(1, count - 1);
             float freq = freqStart + (freqEnd - freqStart) * t;
             phase += 2.0 * Math.PI * freq / SAMPLE_RATE;
-            // Warm blend of sine + soft 2nd harmonic
             double wave = 0.78 * Math.sin(phase) + 0.22 * Math.sin(phase * 2.0);
-            // Smooth attack and exponential release to avoid clicks
             double env = Math.min(1.0, i / (SAMPLE_RATE * 0.006)) * Math.pow(1.0 - t, 1.4);
             buf[i] = (short) Math.max(-32767, Math.min(32767, wave * env * gain * 32767.0));
         }

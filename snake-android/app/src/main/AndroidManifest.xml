@@ -1,19 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.snakestudio.snake"
-    android:versionCode="1"
-    android:versionName="1.0.0">
+    android:versionCode="2"
+    android:versionName="2.0.0">
 
     <uses-sdk
         android:minSdkVersion="21"
-        android:targetSdkVersion="34" />
+        android:targetSdkVersion="35" />
 
     <application
         android:allowBackup="true"
+        android:appCategory="game"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:debuggable="false"
+        android:enableOnBackInvokedCallback="true"
+        android:fullBackupContent="@xml/backup_rules"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round"
+        android:isGame="true"
         android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
 

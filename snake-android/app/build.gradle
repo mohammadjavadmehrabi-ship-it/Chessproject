@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.snakestudio.snake'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.snakestudio.snake"
+        minSdk 21
+        targetSdk 35
+        versionCode 2
+        versionName "2.0.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // Zero external runtime dependencies: fast, tiny, offline, privacy-friendly!
+}

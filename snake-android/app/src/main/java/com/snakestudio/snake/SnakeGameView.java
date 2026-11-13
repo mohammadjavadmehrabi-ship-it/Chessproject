@@ -20,21 +20,24 @@ import java.util.List;
 import java.util.Random;
 
 /**
- * High-FPS hardware-accelerated native Canvas view for the Snake game.
- * Features smooth sub-cell interpolation, 3 themes, Persian/English UI,
- * swipe + optional on-screen D-Pad controls, particles, floating score popups,
- * screen shake, and persistent per-mode high scores.
+ * High-FPS hardware-accelerated native Canvas view for Snake Pro v2.0.
+ * Features atmospheric ambient background, 3D-shaded serpent with drop shadows,
+ * dorsal scales, blinking food-tracking eyes, glowing apples, golden stars,
+ * animated twin wormhole portals, 3 power-up orbs (Shield, Slow-Mo, 2x Score),
+ * 6 game modes, 4 visual themes, bilingual Persian/English UI, and persistent high scores.
  */
 public final class SnakeGameView extends View implements GameEngine.Listener {
 
     private static final String PREFS_NAME = "snake_studio_prefs";
-    private static final int MAX_PARTICLES = 56;
-    private static final int MAX_FLOATS = 12;
+    private static final int MAX_PARTICLES = 84;
+    private static final int MAX_FLOATS = 14;
+    private static final int AMBIENT_ORBS = 8;
 
     private static final class Particle {
         boolean active;
         float x, y, vx, vy, radius, life, maxLife;
         int color;
+        boolean ring;
     }
 
     private static final class FloatingText {
@@ -67,17 +70,19 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     private float boardLeft, boardTop, boardW, boardH, cellSize;
     private final RectF boardRect = new RectF();
     private final RectF boardFrameRect = new RectF();
+    private final RectF boardShadowRect = new RectF();
     private final RectF scoreBadgeRect = new RectF();
     private final RectF bestBadgeRect = new RectF();
     private final RectF btnPauseRect = new RectF();
     private final RectF btnSoundRect = new RectF();
+    private final RectF statusBarRect = new RectF();
     private final RectF[] dpadRects = new RectF[]{new RectF(), new RectF(), new RectF(), new RectF()};
     private final RectF modalRect = new RectF();
 
-    // Menu / Pause / GameOver hit rects
-    private final RectF[] btnModeRects = new RectF[]{new RectF(), new RectF(), new RectF()};
+    // Menu / Pause / GameOver hit rects (6 modes, 3 speeds, 4 themes)
+    private final RectF[] btnModeRects = new RectF[GameEngine.MODE_COUNT];
     private final RectF[] btnSpeedRects = new RectF[]{new RectF(), new RectF(), new RectF()};
-    private final RectF[] btnThemeRects = new RectF[]{new RectF(), new RectF(), new RectF()};
+    private final RectF[] btnThemeRects = new RectF[ThemePalette.THEME_COUNT];
     private final RectF btnDpadToggleRect = new RectF();
     private final RectF btnLangToggleRect = new RectF();
     private final RectF btnPrimaryRect = new RectF();
@@ -87,21 +92,27 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     private final RectF statBoxRect = new RectF();
 
     // Pre-allocated Paints & Paths (zero GC in render loop)
+    private final Paint bgPaint = new Paint();
     private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint snakePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint portalPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint portalBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path iconPath = new Path();
-    private final DashPathEffect portalDash;
+    private final DashPathEffect[] portalDashFrames = new DashPathEffect[24];
+    private LinearGradient cachedBgGradient = null;
+    private int cachedBgThemeId = -1;
 
     // Pre-allocated interpolation buffers
     private final float[] interpX = new float[GameEngine.COLS * GameEngine.ROWS + 4];
     private final float[] interpY = new float[GameEngine.COLS * GameEngine.ROWS + 4];
 
-    // FX pools
+    // FX pools & ambient background orbs
     private final Particle[] particles = new Particle[MAX_PARTICLES];
     private final FloatingText[] floats = new FloatingText[MAX_FLOATS];
+    private final float[] orbPhase = new float[AMBIENT_ORBS];
+    private final float[] orbSpeed = new float[AMBIENT_ORBS];
+    private final float[] orbSize = new float[AMBIENT_ORBS];
 
     // Timing & visual animations
     private long lastFrameNanos = 0L;
@@ -109,6 +120,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     private float shakeTime = 0f;
     private float scorePop = 0f;
     private float overlayAlpha = 1f;
+    private float trailTimer = 0f;
     private int pressedDpadDir = -1;
     private int activeDpadPointer = -1;
 
@@ -116,7 +128,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     private int swipePointerId = -1;
     private float swipeStartX = 0f;
     private float swipeStartY = 0f;
-    private float minSwipePx;
+    private final float minSwipePx;
 
     public interface ThemeChangeCallback {
         void onThemeChanged(int bgOuterColor);
@@ -133,18 +145,30 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         this.engine = new GameEngine();
         this.sound = new SoundEngine();
 
+        for (int i = 0; i < btnModeRects.length; i++) btnModeRects[i] = new RectF();
+        for (int i = 0; i < btnThemeRects.length; i++) btnThemeRects[i] = new RectF();
         for (int i = 0; i < MAX_PARTICLES; i++) particles[i] = new Particle();
         for (int i = 0; i < MAX_FLOATS; i++) floats[i] = new FloatingText();
+        for (int i = 0; i < AMBIENT_ORBS; i++) {
+            orbPhase[i] = i * 1.37f;
+            orbSpeed[i] = 0.22f + (i % 4) * 0.09f;
+            orbSize[i] = dp(38 + (i % 3) * 26);
+        }
 
         strokePaint.setStyle(Paint.Style.STROKE);
         snakePaint.setStyle(Paint.Style.STROKE);
         snakePaint.setStrokeCap(Paint.Cap.ROUND);
         snakePaint.setStrokeJoin(Paint.Join.ROUND);
 
-        portalPaint.setStyle(Paint.Style.STROKE);
-        portalPaint.setStrokeWidth(dp(2.5f));
-        portalDash = new DashPathEffect(new float[]{dp(10), dp(7)}, 0f);
-        portalPaint.setPathEffect(portalDash);
+        portalBorderPaint.setStyle(Paint.Style.STROKE);
+        portalBorderPaint.setStrokeWidth(dp(2.6f));
+        float dashOn = dp(11);
+        float dashOff = dp(7);
+        float dashPeriod = dashOn + dashOff;
+        for (int i = 0; i < portalDashFrames.length; i++) {
+            float ph = -(dashPeriod * i) / portalDashFrames.length;
+            portalDashFrames[i] = new DashPathEffect(new float[]{dashOn, dashOff}, ph);
+        }
 
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
@@ -202,9 +226,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         sound.release();
     }
 
-    /**
-     * Handles system Back button cleanly. Returns true if consumed.
-     */
     public boolean handleBackPressed() {
         int st = engine.getState();
         if (st == GameEngine.STATE_PLAYING) {
@@ -222,9 +243,9 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     }
 
     private void loadPrefs() {
-        engine.setBestScore(GameEngine.MODE_CLASSIC, prefs.getInt("best_0", 0));
-        engine.setBestScore(GameEngine.MODE_PORTAL, prefs.getInt("best_1", 0));
-        engine.setBestScore(GameEngine.MODE_OBSTACLES, prefs.getInt("best_2", 0));
+        for (int m = 0; m < GameEngine.MODE_COUNT; m++) {
+            engine.setBestScore(m, prefs.getInt("best_" + m, 0));
+        }
         engine.setMode(prefs.getInt("mode", GameEngine.MODE_CLASSIC));
         engine.setSpeedLevel(prefs.getInt("speed", GameEngine.SPEED_NORMAL));
         palette = ThemePalette.byId(prefs.getInt("theme", ThemePalette.THEME_NEON));
@@ -235,9 +256,9 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
 
     private void savePrefs() {
         SharedPreferences.Editor ed = prefs.edit();
-        ed.putInt("best_0", engine.getBestScore(GameEngine.MODE_CLASSIC));
-        ed.putInt("best_1", engine.getBestScore(GameEngine.MODE_PORTAL));
-        ed.putInt("best_2", engine.getBestScore(GameEngine.MODE_OBSTACLES));
+        for (int m = 0; m < GameEngine.MODE_COUNT; m++) {
+            ed.putInt("best_" + m, engine.getBestScore(m));
+        }
         ed.putInt("mode", engine.getMode());
         ed.putInt("speed", engine.getSpeedLevel());
         ed.putInt("theme", palette.id);
@@ -256,6 +277,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         super.onSizeChanged(w, h, oldw, oldh);
         viewW = w;
         viewH = h;
+        cachedBgGradient = null;
         computeLayout(w, h);
     }
 
@@ -270,36 +292,39 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         float usableH = Math.max(dp(200), safeB - safeT);
 
         // 1. Top HUD Bar
-        float hudH = Math.min(dp(54), usableH * 0.082f);
+        float hudH = Math.min(dp(52), usableH * 0.080f);
         float hudTop = safeT;
         float hudBot = hudTop + hudH;
 
         float iconBtnSize = hudH * 0.88f;
         float gap = dp(8);
 
-        // Rightmost buttons: Pause & Sound
         btnPauseRect.set(safeR - iconBtnSize, hudTop + (hudH - iconBtnSize) * 0.5f,
                 safeR, hudTop + (hudH + iconBtnSize) * 0.5f);
         btnSoundRect.set(btnPauseRect.left - gap - iconBtnSize, btnPauseRect.top,
                 btnPauseRect.left - gap, btnPauseRect.bottom);
 
-        // Score & Best badges share remaining left space
         float badgesRight = btnSoundRect.left - gap;
         float badgesTotalW = Math.max(dp(100), badgesRight - safeL);
         float badgeW = (badgesTotalW - gap) * 0.5f;
         scoreBadgeRect.set(safeL, hudTop, safeL + badgeW, hudBot);
         bestBadgeRect.set(scoreBadgeRect.right + gap, hudTop, badgesRight, hudBot);
 
+        // Slim dynamic status strip below HUD (for Time Blitz countdown & active Power-Ups)
+        float statusTop = hudBot + dp(6);
+        float statusH = dp(18);
+        statusBarRect.set(safeL, statusTop, safeR, statusTop + statusH);
+
         // 2. Bottom D-Pad zone (if enabled)
-        float playTop = hudBot + dp(10);
+        float playTop = statusBarRect.bottom + dp(6);
         float playBot;
         if (showDpad) {
-            float dpadZoneH = Math.min(dp(164), usableH * 0.245f);
+            float dpadZoneH = Math.min(dp(158), usableH * 0.235f);
             float dpadTop = safeB - dpadZoneH;
-            playBot = dpadTop - dp(10);
+            playBot = dpadTop - dp(8);
             computeDpadLayout(w * 0.5f, dpadTop + dpadZoneH * 0.5f, dpadZoneH);
         } else {
-            playBot = safeB - dp(24);
+            playBot = safeB - dp(22);
             for (int i = 0; i < 4; i++) dpadRects[i].setEmpty();
         }
 
@@ -314,13 +339,15 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         boardTop = playTop + (playBot - playTop - boardH) * 0.5f;
         boardRect.set(boardLeft, boardTop, boardLeft + boardW, boardTop + boardH);
 
-        float framePad = dp(5);
+        float framePad = dp(6);
         boardFrameRect.set(boardLeft - framePad, boardTop - framePad,
                 boardRect.right + framePad, boardRect.bottom + framePad);
+        boardShadowRect.set(boardFrameRect.left + dp(2), boardFrameRect.top + dp(5),
+                boardFrameRect.right + dp(2), boardFrameRect.bottom + dp(6));
 
         // 4. Overlay modal bounds
-        float modalW = Math.min(usableW - dp(8), dp(356));
-        float modalMaxH = Math.min(usableH - dp(16), dp(530));
+        float modalW = Math.min(usableW - dp(6), dp(364));
+        float modalMaxH = Math.min(usableH - dp(10), dp(562));
         float modalL = (w - modalW) * 0.5f;
         float modalT = safeT + (usableH - modalMaxH) * 0.5f;
         modalRect.set(modalL, modalT, modalL + modalW, modalT + modalMaxH);
@@ -328,20 +355,16 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
 
     private void computeDpadLayout(float cx, float cy, float zoneH) {
         float btnW = Math.min(dp(64), zoneH * 0.40f);
-        float btnH = Math.min(dp(50), zoneH * 0.31f);
+        float btnH = Math.min(dp(48), zoneH * 0.305f);
         float sepX = btnW * 0.96f;
         float sepY = btnH * 1.02f;
 
-        // UP
         dpadRects[GameEngine.DIR_UP].set(cx - btnW * 0.5f, cy - sepY - btnH * 0.5f,
                 cx + btnW * 0.5f, cy - sepY + btnH * 0.5f);
-        // DOWN
         dpadRects[GameEngine.DIR_DOWN].set(cx - btnW * 0.5f, cy + sepY - btnH * 0.5f,
                 cx + btnW * 0.5f, cy + sepY + btnH * 0.5f);
-        // LEFT
         dpadRects[GameEngine.DIR_LEFT].set(cx - sepX - btnW * 0.5f, cy - btnH * 0.5f,
                 cx - sepX + btnW * 0.5f, cy + btnH * 0.5f);
-        // RIGHT
         dpadRects[GameEngine.DIR_RIGHT].set(cx + sepX - btnW * 0.5f, cy - btnH * 0.5f,
                 cx + sepX + btnW * 0.5f, cy + btnH * 0.5f);
     }
@@ -349,15 +372,17 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     // --- GameEngine.Listener callbacks ---
 
     @Override
-    public void onEatFood(int cellX, int cellY, int pointsAwarded, int comboCount) {
+    public void onEatFood(int cellX, int cellY, int pointsAwarded, int comboCount, boolean doubled) {
         sound.play(SoundEngine.SND_EAT);
         performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
         scorePop = 1f;
         float px = boardLeft + (cellX + 0.5f) * cellSize;
         float py = boardTop + (cellY + 0.5f) * cellSize;
-        spawnParticles(px, py, 14, palette.foodBody, palette.snakeHead);
-        String label = "+" + Strings.num(pointsAwarded, persian);
-        spawnFloatingText(px, py - cellSize * 0.4f, label, palette.textPrimary, false);
+        spawnParticles(px, py, 16, palette.foodBody, doubled ? palette.powerDouble : palette.snakeHead);
+        spawnShockRing(px, py, palette.foodBody);
+        String label = "+" + Strings.num(pointsAwarded, persian) + (doubled ? " (×2)" : "");
+        spawnFloatingText(px, py - cellSize * 0.4f, label,
+                doubled ? palette.powerDouble : palette.textPrimary, doubled);
         if (comboCount >= 2) {
             spawnFloatingText(px, py - cellSize * 1.35f,
                     Strings.comboTag(comboCount, persian), palette.bonusBody, true);
@@ -366,16 +391,60 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     }
 
     @Override
-    public void onEatBonus(int cellX, int cellY, int pointsAwarded) {
+    public void onEatBonus(int cellX, int cellY, int pointsAwarded, boolean doubled) {
         sound.play(SoundEngine.SND_BONUS);
         performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
-        scorePop = 1.25f;
+        scorePop = 1.3f;
         float px = boardLeft + (cellX + 0.5f) * cellSize;
         float py = boardTop + (cellY + 0.5f) * cellSize;
-        spawnParticles(px, py, 24, palette.bonusBody, 0xFFFFFFFF);
+        spawnParticles(px, py, 26, palette.bonusBody, 0xFFFFFFFF);
+        spawnShockRing(px, py, palette.bonusBody);
         spawnFloatingText(px, py - cellSize * 0.5f,
                 "+" + Strings.num(pointsAwarded, persian) + " ★", palette.bonusBody, true);
         savePrefs();
+    }
+
+    @Override
+    public void onCollectPowerUp(int cellX, int cellY, int powerType) {
+        sound.play(SoundEngine.SND_POWERUP);
+        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+        float px = boardLeft + (cellX + 0.5f) * cellSize;
+        float py = boardTop + (cellY + 0.5f) * cellSize;
+        int col = getPowerColor(powerType);
+        spawnParticles(px, py, 22, col, 0xFFFFFFFF);
+        spawnShockRing(px, py, col);
+        String msg;
+        if (powerType == GameEngine.POWER_SHIELD) msg = Strings.powerShieldName(persian);
+        else if (powerType == GameEngine.POWER_SLOW) msg = Strings.powerSlowName(persian);
+        else msg = Strings.powerDoubleName(persian);
+        spawnFloatingText(px, py - cellSize * 0.5f, msg, col, true);
+    }
+
+    @Override
+    public void onShieldSave(int cellX, int cellY) {
+        sound.play(SoundEngine.SND_SHIELD_SAVE);
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        shakeTime = 0.16f;
+        float px = boardLeft + (cellX + 0.5f) * cellSize;
+        float py = boardTop + (cellY + 0.5f) * cellSize;
+        spawnParticles(px, py, 26, palette.powerShield, 0xFFFFFFFF);
+        spawnShockRing(px, py, palette.powerShield);
+        spawnFloatingText(px, py - cellSize * 0.5f, Strings.powerShieldSaved(persian),
+                palette.powerShield, true);
+    }
+
+    @Override
+    public void onPortalWarp(int fromX, int fromY, int toX, int toY) {
+        sound.play(SoundEngine.SND_WARP);
+        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+        float fx = boardLeft + (fromX + 0.5f) * cellSize;
+        float fy = boardTop + (fromY + 0.5f) * cellSize;
+        float tx = boardLeft + (toX + 0.5f) * cellSize;
+        float ty = boardTop + (toY + 0.5f) * cellSize;
+        spawnParticles(fx, fy, 12, palette.portalA, palette.portalB);
+        spawnParticles(tx, ty, 16, palette.portalB, palette.portalA);
+        spawnShockRing(tx, ty, palette.portalB);
+        spawnFloatingText(tx, ty - cellSize * 0.6f, Strings.portalWarp(persian), palette.portalA, false);
     }
 
     @Override
@@ -384,23 +453,31 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     }
 
     @Override
-    public void onGameOver(boolean won, boolean newBest) {
-        if (won || newBest) {
+    public void onGameOver(boolean won, boolean timeUp, boolean newBest) {
+        if (won || newBest || timeUp) {
             sound.play(SoundEngine.SND_NEW_RECORD);
         } else {
             sound.play(SoundEngine.SND_GAME_OVER);
         }
         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-        shakeTime = won ? 0f : 0.30f;
+        shakeTime = (won || timeUp) ? 0f : 0.30f;
         overlayAlpha = 0f;
         List<GameEngine.Cell> sn = engine.getSnake();
         if (!sn.isEmpty()) {
             GameEngine.Cell head = sn.get(0);
             float px = boardLeft + (head.x + 0.5f) * cellSize;
             float py = boardTop + (head.y + 0.5f) * cellSize;
-            spawnParticles(px, py, 26, won ? palette.bonusBody : palette.foodBody, palette.snakeHead);
+            spawnParticles(px, py, 28,
+                    (won || timeUp) ? palette.bonusBody : palette.foodBody, palette.snakeHead);
+            spawnShockRing(px, py, (won || timeUp) ? palette.bonusBody : palette.foodBody);
         }
         savePrefs();
+    }
+
+    private int getPowerColor(int powerType) {
+        if (powerType == GameEngine.POWER_SHIELD) return palette.powerShield;
+        if (powerType == GameEngine.POWER_SLOW) return palette.powerSlow;
+        return palette.powerDouble;
     }
 
     private void spawnParticles(float x, float y, int count, int colA, int colB) {
@@ -409,17 +486,37 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             Particle p = particles[i];
             if (!p.active) {
                 p.active = true;
+                p.ring = false;
                 p.x = x;
                 p.y = y;
                 double ang = fxRng.nextDouble() * Math.PI * 2.0;
-                float spd = dp(45) + fxRng.nextFloat() * dp(120);
+                float spd = dp(48) + fxRng.nextFloat() * dp(130);
                 p.vx = (float) Math.cos(ang) * spd;
                 p.vy = (float) Math.sin(ang) * spd;
                 p.radius = dp(2.2f) + fxRng.nextFloat() * dp(3.0f);
-                p.maxLife = 0.35f + fxRng.nextFloat() * 0.30f;
+                p.maxLife = 0.36f + fxRng.nextFloat() * 0.32f;
                 p.life = p.maxLife;
                 p.color = (spawned % 2 == 0) ? colA : colB;
                 spawned++;
+            }
+        }
+    }
+
+    private void spawnShockRing(float x, float y, int color) {
+        for (int i = 0; i < MAX_PARTICLES; i++) {
+            Particle p = particles[i];
+            if (!p.active) {
+                p.active = true;
+                p.ring = true;
+                p.x = x;
+                p.y = y;
+                p.vx = 0f;
+                p.vy = 0f;
+                p.radius = cellSize * 0.35f;
+                p.maxLife = 0.38f;
+                p.life = p.maxLife;
+                p.color = color;
+                return;
             }
         }
     }
@@ -429,10 +526,10 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             FloatingText ft = floats[i];
             if (!ft.active) {
                 ft.active = true;
-                ft.x = Math.max(boardLeft + dp(34), Math.min(boardRect.right - dp(34), x));
+                ft.x = Math.max(boardLeft + dp(40), Math.min(boardRect.right - dp(40), x));
                 ft.y = Math.max(boardTop + dp(20), y);
-                ft.vy = -dp(42);
-                ft.maxLife = 0.85f;
+                ft.vy = -dp(44);
+                ft.maxLife = 0.90f;
                 ft.life = ft.maxLife;
                 ft.text = text;
                 ft.color = color;
@@ -461,17 +558,17 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         lastFrameNanos = now;
         animTime += dt;
 
-        // Advance simulation & effects
         engine.update(dt);
         updateEffects(dt);
 
-        // Background
-        canvas.drawColor(palette.bgOuter);
+        // 1. Atmospheric gradient background + soft floating orbs
+        drawAtmosphericBackground(canvas);
 
-        // Top HUD
+        // 2. Top HUD & active status bar
         drawTopHud(canvas);
+        drawActiveStatusStrip(canvas);
 
-        // Board with optional impact shake
+        // 3. Game board with optional impact shake
         canvas.save();
         if (shakeTime > 0f) {
             float mag = dp(7) * (shakeTime / 0.30f);
@@ -480,25 +577,27 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             canvas.translate(sx, sy);
         }
         drawBoard(canvas);
+        drawPortals(canvas);
         drawObstacles(canvas);
         drawFood(canvas);
         drawBonusFood(canvas);
+        drawPowerUpOrb(canvas);
         drawSnake(canvas);
         drawParticles(canvas);
         drawFloatingTexts(canvas);
         canvas.restore();
 
-        // Bottom Controls / Hint
+        // 4. Bottom Controls / Hint
         if (showDpad) {
             drawDpad(canvas);
         } else if (engine.getState() == GameEngine.STATE_PLAYING) {
-            textPaint.setColor(withAlpha(palette.textSecondary, 165));
+            textPaint.setColor(withAlpha(palette.textSecondary, 175));
             textPaint.setTextSize(dp(12.5f));
             canvas.drawText(Strings.swipeHint(persian), viewW * 0.5f,
-                    boardFrameRect.bottom + dp(20), textPaint);
+                    boardFrameRect.bottom + dp(19), textPaint);
         }
 
-        // Overlays
+        // 5. Overlays
         int st = engine.getState();
         if (st == GameEngine.STATE_MENU) {
             drawMenuOverlay(canvas);
@@ -512,15 +611,27 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     }
 
     private void updateEffects(float dt) {
-        if (shakeTime > 0f) {
-            shakeTime = Math.max(0f, shakeTime - dt);
+        if (shakeTime > 0f) shakeTime = Math.max(0f, shakeTime - dt);
+        if (scorePop > 0f) scorePop = Math.max(0f, scorePop - dt * 4.5f);
+        if (overlayAlpha < 1f) overlayAlpha = Math.min(1f, overlayAlpha + dt * 5.2f);
+
+        // Emit radiant trail sparks behind tail during Combo Fever or Double Score!
+        if (engine.getState() == GameEngine.STATE_PLAYING
+                && (engine.getComboCount() >= 3 || engine.getDoubleTimeLeft() > 0f)) {
+            trailTimer += dt;
+            if (trailTimer >= 0.06f) {
+                trailTimer = 0f;
+                List<GameEngine.Cell> sn = engine.getSnake();
+                if (!sn.isEmpty()) {
+                    GameEngine.Cell tail = sn.get(sn.size() - 1);
+                    float tx = boardLeft + (tail.x + 0.5f) * cellSize;
+                    float ty = boardTop + (tail.y + 0.5f) * cellSize;
+                    int col = (engine.getDoubleTimeLeft() > 0f) ? palette.powerDouble : palette.bonusBody;
+                    spawnParticles(tx, ty, 1, col, palette.snakeHead);
+                }
+            }
         }
-        if (scorePop > 0f) {
-            scorePop = Math.max(0f, scorePop - dt * 4.5f);
-        }
-        if (overlayAlpha < 1f) {
-            overlayAlpha = Math.min(1f, overlayAlpha + dt * 5.0f);
-        }
+
         for (int i = 0; i < MAX_PARTICLES; i++) {
             Particle p = particles[i];
             if (!p.active) continue;
@@ -529,10 +640,14 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 p.active = false;
                 continue;
             }
-            p.x += p.vx * dt;
-            p.y += p.vy * dt;
-            p.vx *= 0.94f;
-            p.vy *= 0.94f;
+            if (p.ring) {
+                p.radius += cellSize * 3.8f * dt;
+            } else {
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+                p.vx *= 0.94f;
+                p.vy *= 0.94f;
+            }
         }
         for (int i = 0; i < MAX_FLOATS; i++) {
             FloatingText ft = floats[i];
@@ -543,6 +658,26 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 continue;
             }
             ft.y += ft.vy * dt;
+        }
+    }
+
+    private void drawAtmosphericBackground(Canvas canvas) {
+        if (cachedBgGradient == null || cachedBgThemeId != palette.id) {
+            cachedBgGradient = new LinearGradient(0, 0, viewW * 0.3f, viewH,
+                    palette.bgOuterTop, palette.bgOuterBottom, Shader.TileMode.CLAMP);
+            cachedBgThemeId = palette.id;
+        }
+        bgPaint.setShader(cachedBgGradient);
+        canvas.drawRect(0, 0, viewW, viewH, bgPaint);
+
+        // Soft drifting bokeh light orbs
+        fillPaint.setColor(palette.ambientOrb);
+        for (int i = 0; i < AMBIENT_ORBS; i++) {
+            float px = viewW * (0.12f + 0.76f * ((i * 37 % 100) / 100f))
+                    + (float) Math.sin(animTime * orbSpeed[i] + orbPhase[i]) * dp(26);
+            float py = viewH * (0.10f + 0.80f * ((i * 61 % 100) / 100f))
+                    + (float) Math.cos(animTime * orbSpeed[i] * 0.8f + orbPhase[i]) * dp(22);
+            canvas.drawCircle(px, py, orbSize[i], fillPaint);
         }
     }
 
@@ -557,25 +692,22 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         }
         fillPaint.setColor(palette.bgTopBar);
         canvas.drawRoundRect(scoreBadgeRect, corner, corner, fillPaint);
-        strokePaint.setColor(palette.boardBorder);
-        strokePaint.setStrokeWidth(dp(1.2f));
+        strokePaint.setColor(engine.getDoubleTimeLeft() > 0f ? palette.powerDouble : palette.boardBorder);
+        strokePaint.setStrokeWidth(engine.getDoubleTimeLeft() > 0f ? dp(1.8f) : dp(1.2f));
         canvas.drawRoundRect(scoreBadgeRect, corner, corner, strokePaint);
 
-        // Mini apple icon on left of score badge
-        float iconX = scoreBadgeRect.left + dp(18);
-        float iconY = scoreBadgeRect.centerY();
-        drawMiniApple(canvas, iconX, iconY, dp(7.5f));
+        drawMiniApple(canvas, scoreBadgeRect.left + dp(18), scoreBadgeRect.centerY(), dp(7.5f));
 
         textPaint.setColor(palette.textSecondary);
-        textPaint.setTextSize(dp(10.5f));
+        textPaint.setTextSize(dp(10f));
         float textCenterX = (scoreBadgeRect.left + dp(32) + scoreBadgeRect.right - dp(6)) * 0.5f;
         canvas.drawText(Strings.scoreLabel(persian), textCenterX,
                 scoreBadgeRect.top + scoreBadgeRect.height() * 0.36f, textPaint);
 
-        textPaint.setColor(palette.textPrimary);
-        textPaint.setTextSize(dp(17.5f));
+        textPaint.setColor(engine.getDoubleTimeLeft() > 0f ? palette.powerDouble : palette.textPrimary);
+        textPaint.setTextSize(dp(17f));
         canvas.drawText(Strings.num(engine.getScore(), persian), textCenterX,
-                scoreBadgeRect.top + scoreBadgeRect.height() * 0.80f, textPaint);
+                scoreBadgeRect.top + scoreBadgeRect.height() * 0.81f, textPaint);
         canvas.restore();
 
         // Best Score Badge
@@ -589,14 +721,14 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
 
         float bestCenterX = (bestBadgeRect.left + dp(32) + bestBadgeRect.right - dp(6)) * 0.5f;
         textPaint.setColor(palette.textSecondary);
-        textPaint.setTextSize(dp(10.5f));
+        textPaint.setTextSize(dp(10f));
         canvas.drawText(Strings.bestLabel(persian), bestCenterX,
                 bestBadgeRect.top + bestBadgeRect.height() * 0.36f, textPaint);
 
         textPaint.setColor(palette.bonusBody);
-        textPaint.setTextSize(dp(17.5f));
+        textPaint.setTextSize(dp(17f));
         canvas.drawText(Strings.num(engine.getCurrentBestScore(), persian), bestCenterX,
-                bestBadgeRect.top + bestBadgeRect.height() * 0.80f, textPaint);
+                bestBadgeRect.top + bestBadgeRect.height() * 0.81f, textPaint);
 
         // Sound Button
         drawCircleButton(canvas, btnSoundRect, sound.isMuted() ? palette.pillBg : palette.bgTopBar);
@@ -614,6 +746,83 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         }
     }
 
+    private void drawActiveStatusStrip(Canvas canvas) {
+        if (engine.getState() == GameEngine.STATE_MENU) return;
+
+        float l = statusBarRect.left;
+        float t = statusBarRect.top;
+        float b = statusBarRect.bottom;
+        float h = statusBarRect.height();
+
+        // In Time Blitz mode: glowing countdown bar!
+        if (engine.getMode() == GameEngine.MODE_BLITZ) {
+            float sec = engine.getBlitzTimeLeft();
+            float frac = Math.max(0f, Math.min(1f, sec / GameEngine.BLITZ_INITIAL_SEC));
+            boolean urgent = sec <= 10f;
+            int barCol = urgent ? palette.foodBody : palette.accent;
+
+            fillPaint.setColor(palette.pillBg);
+            canvas.drawRoundRect(statusBarRect, h * 0.5f, h * 0.5f, fillPaint);
+
+            float fillW = Math.max(h, statusBarRect.width() * frac);
+            tempRect.set(l, t, l + fillW, b);
+            fillPaint.setColor(withAlpha(barCol, urgent ? 220 : 170));
+            canvas.drawRoundRect(tempRect, h * 0.5f, h * 0.5f, fillPaint);
+
+            textPaint.setColor(0xFFFFFFFF);
+            textPaint.setTextSize(dp(11f));
+            Paint.FontMetrics fm = textPaint.getFontMetrics();
+            float baseY = statusBarRect.centerY() - (fm.ascent + fm.descent) * 0.5f;
+            canvas.drawText(Strings.timeLeftTag((int) Math.ceil(sec), persian),
+                    statusBarRect.centerX(), baseY, textPaint);
+            return;
+        }
+
+        // Otherwise show mode badge + active power-up pills cleanly centered
+        float cx = statusBarRect.centerX();
+        float chipY = statusBarRect.centerY();
+
+        if (engine.isShieldActive() || engine.getSlowTimeLeft() > 0f || engine.getDoubleTimeLeft() > 0f) {
+            float curX = l;
+            if (engine.isShieldActive()) {
+                curX = drawStatusChip(canvas, curX, t, h, Strings.powerShieldName(persian), palette.powerShield);
+            }
+            if (engine.getSlowTimeLeft() > 0f) {
+                curX = drawStatusChip(canvas, curX, t, h,
+                        Strings.powerSlowName(persian) + " " + Strings.num((int) Math.ceil(engine.getSlowTimeLeft()), persian),
+                        palette.powerSlow);
+            }
+            if (engine.getDoubleTimeLeft() > 0f) {
+                drawStatusChip(canvas, curX, t, h,
+                        Strings.powerDoubleName(persian) + " " + Strings.num((int) Math.ceil(engine.getDoubleTimeLeft()), persian),
+                        palette.powerDouble);
+            }
+        } else {
+            textPaint.setColor(withAlpha(palette.textSecondary, 185));
+            textPaint.setTextSize(dp(11.5f));
+            Paint.FontMetrics fm = textPaint.getFontMetrics();
+            float baseY = chipY - (fm.ascent + fm.descent) * 0.5f;
+            canvas.drawText(Strings.modeName(engine.getMode(), persian) + "  •  "
+                    + Strings.speedName(engine.getSpeedLevel(), persian), cx, baseY, textPaint);
+        }
+    }
+
+    private float drawStatusChip(Canvas canvas, float x, float top, float h, String label, int col) {
+        textPaint.setTextSize(dp(10.5f));
+        float w = Math.max(dp(74), textPaint.measureText(label) + dp(18));
+        tempRect.set(x, top, x + w, top + h);
+        fillPaint.setColor(withAlpha(col, 48));
+        canvas.drawRoundRect(tempRect, h * 0.5f, h * 0.5f, fillPaint);
+        strokePaint.setColor(col);
+        strokePaint.setStrokeWidth(dp(1.1f));
+        canvas.drawRoundRect(tempRect, h * 0.5f, h * 0.5f, strokePaint);
+        textPaint.setColor(col);
+        Paint.FontMetrics fm = textPaint.getFontMetrics();
+        float baseY = tempRect.centerY() - (fm.ascent + fm.descent) * 0.5f;
+        canvas.drawText(label, tempRect.centerX(), baseY, textPaint);
+        return x + w + dp(6);
+    }
+
     private void drawCircleButton(Canvas canvas, RectF rect, int bgColor) {
         float r = rect.width() * 0.5f;
         fillPaint.setColor(bgColor);
@@ -624,8 +833,13 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     }
 
     private void drawBoard(Canvas canvas) {
-        // Outer rounded frame
-        float frameR = dp(14);
+        float frameR = dp(15);
+
+        // Elevated soft 3D drop shadow under board housing
+        fillPaint.setColor(0x55000000);
+        canvas.drawRoundRect(boardShadowRect, frameR, frameR, fillPaint);
+
+        // Outer metallic/glass housing
         fillPaint.setColor(palette.boardFrame);
         canvas.drawRoundRect(boardFrameRect, frameR, frameR, fillPaint);
 
@@ -635,11 +849,10 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         iconPath.addRoundRect(boardRect, dp(10), dp(10), Path.Direction.CW);
         canvas.clipPath(iconPath);
 
-        // Base fill dark cell color
         fillPaint.setColor(palette.cellDark);
         canvas.drawRect(boardRect, fillPaint);
 
-        // Subtle checkerboard light cells
+        // Alternating subtle checkerboard tiles
         fillPaint.setColor(palette.cellLight);
         for (int y = 0; y < GameEngine.ROWS; y++) {
             float top = boardTop + y * cellSize;
@@ -648,24 +861,81 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 canvas.drawRect(left, top, left + cellSize, top + cellSize, fillPaint);
             }
         }
+
+        // Crisp subtle micro-grid intersection dots for tactile depth
+        fillPaint.setColor(palette.cellDot);
+        float dotR = Math.max(1f, dp(1.0f));
+        for (int y = 1; y < GameEngine.ROWS; y++) {
+            float py = boardTop + y * cellSize;
+            for (int x = 1; x < GameEngine.COLS; x++) {
+                canvas.drawCircle(boardLeft + x * cellSize, py, dotR, fillPaint);
+            }
+        }
+
+        // Subtle icy frost inner glow when Slow-Mo is active!
+        if (engine.getSlowTimeLeft() > 0f) {
+            strokePaint.setColor(withAlpha(palette.powerSlow, 110));
+            strokePaint.setStrokeWidth(dp(7));
+            canvas.drawRect(boardRect, strokePaint);
+        }
         canvas.restore();
 
-        // Border (solid in Classic/Obstacles, animated glowing dashed in Portal mode!)
-        if (engine.getMode() == GameEngine.MODE_PORTAL) {
-            portalPaint.setColor(palette.portalBorder);
-            canvas.drawRoundRect(boardFrameRect, frameR, frameR, portalPaint);
+        // Border: animated marching neon dashes for wrap modes, crisp metallic frame for solid walls
+        if (engine.isWrapWalls()) {
+            int dashIdx = ((int) (animTime * 24f)) % portalDashFrames.length;
+            if (dashIdx < 0) dashIdx += portalDashFrames.length;
+            portalBorderPaint.setPathEffect(portalDashFrames[dashIdx]);
+            portalBorderPaint.setColor(engine.getSlowTimeLeft() > 0f ? palette.powerSlow : palette.portalBorder);
+            canvas.drawRoundRect(boardFrameRect, frameR, frameR, portalBorderPaint);
         } else {
-            strokePaint.setColor(palette.boardBorder);
-            strokePaint.setStrokeWidth(dp(2.2f));
+            strokePaint.setColor(engine.getSlowTimeLeft() > 0f ? palette.powerSlow : palette.boardBorder);
+            strokePaint.setStrokeWidth(dp(2.3f));
             canvas.drawRoundRect(boardFrameRect, frameR, frameR, strokePaint);
         }
+    }
+
+    private void drawPortals(Canvas canvas) {
+        GameEngine.Cell a = engine.getPortalA();
+        GameEngine.Cell b = engine.getPortalB();
+        if (a != null) drawSinglePortal(canvas, a, palette.portalA, 1f);
+        if (b != null) drawSinglePortal(canvas, b, palette.portalB, -1f);
+    }
+
+    private void drawSinglePortal(Canvas canvas, GameEngine.Cell cell, int color, float spinDir) {
+        float cx = boardLeft + (cell.x + 0.5f) * cellSize;
+        float cy = boardTop + (cell.y + 0.5f) * cellSize;
+        float r = cellSize * 0.45f;
+
+        // Outer ambient halo
+        fillPaint.setColor(withAlpha(color, 55));
+        canvas.drawCircle(cx, cy, r * 1.45f, fillPaint);
+
+        // Dark void core
+        fillPaint.setColor(0xDD050914);
+        canvas.drawCircle(cx, cy, r * 0.72f, fillPaint);
+
+        // Counter-rotating swirling neon arcs
+        float ang = animTime * 150f * spinDir;
+        strokePaint.setStrokeCap(Paint.Cap.ROUND);
+        strokePaint.setColor(color);
+        strokePaint.setStrokeWidth(dp(2.6f));
+        tempRect.set(cx - r, cy - r, cx + r, cy + r);
+        canvas.drawArc(tempRect, ang, 115f, false, strokePaint);
+        canvas.drawArc(tempRect, ang + 180f, 115f, false, strokePaint);
+
+        float r2 = r * 0.62f;
+        strokePaint.setColor(0xDDFFFFFF);
+        strokePaint.setStrokeWidth(dp(1.8f));
+        tempRect.set(cx - r2, cy - r2, cx + r2, cy + r2);
+        canvas.drawArc(tempRect, -ang * 1.3f, 95f, false, strokePaint);
+        canvas.drawArc(tempRect, -ang * 1.3f + 180f, 95f, false, strokePaint);
     }
 
     private void drawObstacles(Canvas canvas) {
         List<GameEngine.Cell> obs = engine.getObstacles();
         if (obs.isEmpty()) return;
-        float pad = cellSize * 0.08f;
-        float rad = cellSize * 0.20f;
+        float pad = cellSize * 0.06f;
+        float rad = cellSize * 0.22f;
         for (int i = 0; i < obs.size(); i++) {
             GameEngine.Cell c = obs.get(i);
             float l = boardLeft + c.x * cellSize + pad;
@@ -673,21 +943,30 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             float r = l + cellSize - pad * 2f;
             float b = t + cellSize - pad * 2f;
 
-            // Shadow / dark base
+            // Ground shadow
+            tempRect.set(l + dp(1.5f), t + dp(2.2f), r + dp(1.5f), b + dp(2.2f));
+            fillPaint.setColor(0x44000000);
+            canvas.drawRoundRect(tempRect, rad, rad, fillPaint);
+
+            // Deep base edge
             tempRect.set(l, t, r, b);
             fillPaint.setColor(palette.obstacleDark);
             canvas.drawRoundRect(tempRect, rad, rad, fillPaint);
 
-            // Inner raised stone face
-            float bevel = cellSize * 0.10f;
-            tempRect.set(l + bevel * 0.5f, t + bevel * 0.4f, r - bevel * 0.5f, b - bevel);
+            // Raised crystal face
+            float bev = cellSize * 0.11f;
+            tempRect.set(l + bev * 0.45f, t + bev * 0.35f, r - bev * 0.45f, b - bev);
             fillPaint.setColor(palette.obstacleFill);
             canvas.drawRoundRect(tempRect, rad * 0.8f, rad * 0.8f, fillPaint);
 
-            // Top specular rim
+            // Specular crystal rim & diagonal glint
             strokePaint.setColor(palette.obstacleLight);
             strokePaint.setStrokeWidth(dp(1.2f));
-            canvas.drawLine(l + rad, t + bevel * 0.8f, r - rad, t + bevel * 0.8f, strokePaint);
+            strokePaint.setStrokeCap(Paint.Cap.ROUND);
+            canvas.drawLine(l + rad, t + bev * 0.7f, r - rad, t + bev * 0.7f, strokePaint);
+            strokePaint.setColor(withAlpha(palette.obstacleLight, 110));
+            canvas.drawLine(l + cellSize * 0.24f, t + cellSize * 0.56f,
+                    l + cellSize * 0.52f, t + cellSize * 0.26f, strokePaint);
         }
     }
 
@@ -695,38 +974,54 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         GameEngine.Cell f = engine.getFood();
         if (f == null) return;
         float cx = boardLeft + (f.x + 0.5f) * cellSize;
-        float cy = boardTop + (f.y + 0.5f) * cellSize;
-        float pulse = 1f + 0.08f * (float) Math.sin(animTime * 5.2f);
-        float r = cellSize * 0.39f * pulse;
+        float bob = (float) Math.sin(animTime * 4.2f) * cellSize * 0.055f;
+        float cy = boardTop + (f.y + 0.5f) * cellSize + bob;
+        float pulse = 1f + 0.07f * (float) Math.sin(animTime * 5.2f);
+        float r = cellSize * 0.40f * pulse;
 
-        // Soft pulsing glow
+        // Ground shadow beneath floating apple
+        fillPaint.setColor(0x40000000);
+        canvas.drawOval(cx - r * 0.75f, boardTop + (f.y + 0.84f) * cellSize,
+                cx + r * 0.75f, boardTop + (f.y + 0.98f) * cellSize, fillPaint);
+
+        // Soft pulsing multi-layer aura
+        fillPaint.setColor(withAlpha(palette.foodBody, 38));
+        canvas.drawCircle(cx, cy, r * 1.65f, fillPaint);
         fillPaint.setColor(palette.foodGlow);
-        canvas.drawCircle(cx, cy, r * 1.48f, fillPaint);
+        canvas.drawCircle(cx, cy, r * 1.25f, fillPaint);
 
         drawMiniApple(canvas, cx, cy, r);
     }
 
     private void drawMiniApple(Canvas canvas, float cx, float cy, float r) {
+        // Deep outer rim
+        fillPaint.setColor(0x44000000);
+        canvas.drawCircle(cx, cy + r * 0.06f, r * 1.07f, fillPaint);
+
         // Main body
         fillPaint.setColor(palette.foodBody);
         canvas.drawCircle(cx, cy + r * 0.06f, r, fillPaint);
 
-        // Specular highlight
-        fillPaint.setColor(0x88FFFFFF);
-        canvas.drawCircle(cx - r * 0.30f, cy - r * 0.24f, r * 0.26f, fillPaint);
+        // Bright upper-left shading
+        fillPaint.setColor(0x38FFFFFF);
+        canvas.drawCircle(cx - r * 0.16f, cy - r * 0.12f, r * 0.65f, fillPaint);
+
+        // Glossy specular dot
+        fillPaint.setColor(0xCCFFFFFF);
+        canvas.drawCircle(cx - r * 0.30f, cy - r * 0.25f, r * 0.24f, fillPaint);
 
         // Stem
         strokePaint.setColor(0xFF78350F);
-        strokePaint.setStrokeWidth(Math.max(dp(1.4f), r * 0.22f));
+        strokePaint.setStrokeWidth(Math.max(dp(1.4f), r * 0.21f));
         strokePaint.setStrokeCap(Paint.Cap.ROUND);
-        canvas.drawLine(cx, cy - r * 0.72f, cx + r * 0.14f, cy - r * 1.18f, strokePaint);
+        canvas.drawLine(cx, cy - r * 0.70f, cx + r * 0.15f, cy - r * 1.20f, strokePaint);
 
         // Leaf
         fillPaint.setColor(palette.foodLeaf);
         iconPath.reset();
         iconPath.moveTo(cx + r * 0.06f, cy - r * 0.90f);
-        iconPath.quadTo(cx + r * 0.75f, cy - r * 1.25f, cx + r * 0.82f, cy - r * 0.70f);
-        iconPath.quadTo(cx + r * 0.38f, cy - r * 0.65f, cx + r * 0.06f, cy - r * 0.90f);
+        iconPath.quadTo(cx + r * 0.78f, cy - r * 1.28f, cx + r * 0.85f, cy - r * 0.68f);
+        iconPath.quadTo(cx + r * 0.38f, cy - r * 0.64f, cx + r * 0.06f, cy - r * 0.90f);
         canvas.drawPath(iconPath, fillPaint);
     }
 
@@ -737,14 +1032,15 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         float cx = boardLeft + (b.x + 0.5f) * cellSize;
         float cy = boardTop + (b.y + 0.5f) * cellSize;
         float pulse = 1f + 0.10f * (float) Math.sin(animTime * 8.0f);
-        float r = cellSize * 0.42f * pulse;
+        float r = cellSize * 0.43f * pulse;
 
-        // Golden glow
+        fillPaint.setColor(withAlpha(palette.bonusBody, 45));
+        canvas.drawCircle(cx, cy, r * 1.75f, fillPaint);
         fillPaint.setColor(palette.bonusGlow);
-        canvas.drawCircle(cx, cy, r * 1.55f, fillPaint);
+        canvas.drawCircle(cx, cy, r * 1.32f, fillPaint);
 
         // Countdown timer ring
-        float ringR = cellSize * 0.56f;
+        float ringR = cellSize * 0.57f;
         tempRect.set(cx - ringR, cy - ringR, cx + ringR, cy + ringR);
         strokePaint.setColor(0x44FFFFFF);
         strokePaint.setStrokeWidth(dp(2.2f));
@@ -754,11 +1050,11 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
 
         // Rotating 5-point golden star
         canvas.save();
-        canvas.rotate(animTime * 55f, cx, cy);
+        canvas.rotate(animTime * 60f, cx, cy);
         iconPath.reset();
         for (int i = 0; i < 10; i++) {
             double ang = -Math.PI / 2.0 + i * Math.PI / 5.0;
-            float rad = (i % 2 == 0) ? r : r * 0.48f;
+            float rad = (i % 2 == 0) ? r : r * 0.47f;
             float px = cx + (float) Math.cos(ang) * rad;
             float py = cy + (float) Math.sin(ang) * rad;
             if (i == 0) iconPath.moveTo(px, py);
@@ -767,9 +1063,74 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         iconPath.close();
         fillPaint.setColor(palette.bonusBody);
         canvas.drawPath(iconPath, fillPaint);
-        fillPaint.setColor(0xAAFFFFFF);
+        fillPaint.setColor(0xCCFFFFFF);
         canvas.drawCircle(cx, cy, r * 0.25f, fillPaint);
         canvas.restore();
+    }
+
+    private void drawPowerUpOrb(Canvas canvas) {
+        GameEngine.Cell cell = engine.getPowerUpCell();
+        int type = engine.getPowerUpType();
+        if (cell == null || type == GameEngine.POWER_NONE) return;
+
+        float progress = engine.getPowerUpBoardProgress();
+        float cx = boardLeft + (cell.x + 0.5f) * cellSize;
+        float bob = (float) Math.sin(animTime * 5.0f + 1.0f) * cellSize * 0.05f;
+        float cy = boardTop + (cell.y + 0.5f) * cellSize + bob;
+        float r = cellSize * 0.42f;
+        int col = getPowerColor(type);
+
+        // Soft aura + countdown ring
+        fillPaint.setColor(withAlpha(col, 65));
+        canvas.drawCircle(cx, cy, r * 1.55f, fillPaint);
+
+        float ringR = cellSize * 0.55f;
+        tempRect.set(cx - ringR, cy - ringR, cx + ringR, cy + ringR);
+        strokePaint.setColor(0x38FFFFFF);
+        strokePaint.setStrokeWidth(dp(2.0f));
+        canvas.drawOval(tempRect, strokePaint);
+        strokePaint.setColor(col);
+        canvas.drawArc(tempRect, -90f, 360f * progress, false, strokePaint);
+
+        // Orb sphere
+        fillPaint.setColor(0xDD0B1324);
+        canvas.drawCircle(cx, cy, r, fillPaint);
+        strokePaint.setColor(col);
+        strokePaint.setStrokeWidth(dp(2.0f));
+        canvas.drawCircle(cx, cy, r, strokePaint);
+
+        // Crisp inner icon per power-up type
+        if (type == GameEngine.POWER_SHIELD) {
+            // Vector shield emblem
+            fillPaint.setColor(col);
+            iconPath.reset();
+            iconPath.moveTo(cx, cy - r * 0.58f);
+            iconPath.lineTo(cx + r * 0.48f, cy - r * 0.34f);
+            iconPath.lineTo(cx + r * 0.40f, cy + r * 0.22f);
+            iconPath.lineTo(cx, cy + r * 0.58f);
+            iconPath.lineTo(cx - r * 0.40f, cy + r * 0.22f);
+            iconPath.lineTo(cx - r * 0.48f, cy - r * 0.34f);
+            iconPath.close();
+            canvas.drawPath(iconPath, fillPaint);
+        } else if (type == GameEngine.POWER_SLOW) {
+            // Vector hourglass / frost crystal
+            strokePaint.setColor(col);
+            strokePaint.setStrokeWidth(dp(2.0f));
+            strokePaint.setStrokeCap(Paint.Cap.ROUND);
+            float sr = r * 0.52f;
+            canvas.drawLine(cx - sr, cy, cx + sr, cy, strokePaint);
+            canvas.drawLine(cx, cy - sr, cx, cy + sr, strokePaint);
+            float d = sr * 0.7f;
+            canvas.drawLine(cx - d, cy - d, cx + d, cy + d, strokePaint);
+            canvas.drawLine(cx - d, cy + d, cx + d, cy - d, strokePaint);
+        } else {
+            // 2x text emblem
+            textPaint.setColor(col);
+            textPaint.setTextSize(r * 1.15f);
+            Paint.FontMetrics fm = textPaint.getFontMetrics();
+            float baseY = cy - (fm.ascent + fm.descent) * 0.5f;
+            canvas.drawText("×2", cx, baseY, textPaint);
+        }
     }
 
     private void drawSnake(Canvas canvas) {
@@ -787,7 +1148,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 GameEngine.Cell pr = prev.get(i);
                 int dx = c.x - pr.x;
                 int dy = c.y - pr.y;
-                // Only interpolate adjacent cells (skip cross-board portal wrap streaks!)
                 if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) {
                     gx = pr.x + dx * p;
                     gy = pr.y + dy * p;
@@ -797,15 +1157,33 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             interpY[i] = boardTop + (gy + 0.5f) * cellSize;
         }
 
-        float baseDiam = cellSize * 0.80f;
+        float baseDiam = cellSize * 0.82f;
 
-        // PASS 1: Dark outline silhouette (tail to head)
+        // PASS 0: Ground 3D drop shadow beneath entire serpent
+        float shOffX = dp(1.8f);
+        float shOffY = dp(3.0f);
+        snakePaint.setColor(0x42000000);
+        fillPaint.setColor(0x42000000);
+        for (int i = n - 1; i >= 0; i--) {
+            float t = (n <= 1) ? 0f : (i / (float) (n - 1));
+            float taper = (i == 0) ? 1.10f : (1.0f - 0.36f * t * t);
+            float w = baseDiam * taper + dp(2.0f);
+            if (i > 0 && isAdjacentPx(interpX[i], interpY[i], interpX[i - 1], interpY[i - 1])) {
+                snakePaint.setStrokeWidth(w);
+                canvas.drawLine(interpX[i] + shOffX, interpY[i] + shOffY,
+                        interpX[i - 1] + shOffX, interpY[i - 1] + shOffY, snakePaint);
+            } else {
+                canvas.drawCircle(interpX[i] + shOffX, interpY[i] + shOffY, w * 0.5f, fillPaint);
+            }
+        }
+
+        // PASS 1: Deep contrast outline silhouette
         snakePaint.setColor(palette.snakeOutline);
         fillPaint.setColor(palette.snakeOutline);
         for (int i = n - 1; i >= 0; i--) {
             float t = (n <= 1) ? 0f : (i / (float) (n - 1));
-            float taper = (i == 0) ? 1.08f : (1.0f - 0.34f * t * t);
-            float w = baseDiam * taper + dp(2.8f);
+            float taper = (i == 0) ? 1.10f : (1.0f - 0.36f * t * t);
+            float w = baseDiam * taper + dp(3.0f);
             if (i > 0 && isAdjacentPx(interpX[i], interpY[i], interpX[i - 1], interpY[i - 1])) {
                 snakePaint.setStrokeWidth(w);
                 canvas.drawLine(interpX[i], interpY[i], interpX[i - 1], interpY[i - 1], snakePaint);
@@ -817,11 +1195,14 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         // PASS 2: Vibrant Head -> Mid -> Tail gradient body
         for (int i = n - 1; i >= 0; i--) {
             float t = (n <= 1) ? 0f : (i / (float) (n - 1));
-            float taper = (i == 0) ? 1.06f : (1.0f - 0.34f * t * t);
+            float taper = (i == 0) ? 1.08f : (1.0f - 0.36f * t * t);
             float w = baseDiam * taper;
             int segColor = (t < 0.5f)
                     ? ThemePalette.lerpColor(palette.snakeHead, palette.snakeMid, t * 2f)
                     : ThemePalette.lerpColor(palette.snakeMid, palette.snakeTail, (t - 0.5f) * 2f);
+            if (engine.getDoubleTimeLeft() > 0f && (i % 2 == 0)) {
+                segColor = ThemePalette.lerpColor(segColor, palette.powerDouble, 0.28f);
+            }
             snakePaint.setColor(segColor);
             fillPaint.setColor(segColor);
             if (i > 0 && isAdjacentPx(interpX[i], interpY[i], interpX[i - 1], interpY[i - 1])) {
@@ -831,16 +1212,30 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             canvas.drawCircle(interpX[i], interpY[i], w * 0.5f, fillPaint);
         }
 
-        // PASS 3: Subtle glossy dorsal highlight along body
-        fillPaint.setColor(palette.snakeHighlight);
+        // PASS 3: Subtle organic dorsal scale pattern + glossy top highlight
         for (int i = n - 1; i >= 1; i--) {
             float t = i / (float) Math.max(1, n - 1);
-            float r = (baseDiam * (1.0f - 0.34f * t * t)) * 0.19f;
-            canvas.drawCircle(interpX[i] - r * 0.5f, interpY[i] - r * 0.7f, r, fillPaint);
+            float segR = (baseDiam * (1.0f - 0.36f * t * t)) * 0.5f;
+            // Subtle diamond dorsal scale on alternating segments
+            if (i % 2 == 1) {
+                fillPaint.setColor(palette.snakeScale);
+                float sr = segR * 0.42f;
+                iconPath.reset();
+                iconPath.moveTo(interpX[i], interpY[i] - sr);
+                iconPath.lineTo(interpX[i] + sr, interpY[i]);
+                iconPath.lineTo(interpX[i], interpY[i] + sr);
+                iconPath.lineTo(interpX[i] - sr, interpY[i]);
+                iconPath.close();
+                canvas.drawPath(iconPath, fillPaint);
+            }
+            // Glossy spine highlight
+            fillPaint.setColor(palette.snakeHighlight);
+            float hr = segR * 0.34f;
+            canvas.drawCircle(interpX[i] - hr * 0.45f, interpY[i] - hr * 0.72f, hr, fillPaint);
         }
 
-        // PASS 4: Expressive head (flickering tongue + food-tracking eyes)
-        drawSnakeHeadDetails(canvas, interpX[0], interpY[0], baseDiam * 0.53f);
+        // PASS 4: Expressive sculpted head + Shield aura
+        drawSnakeHeadDetails(canvas, interpX[0], interpY[0], baseDiam * 0.55f);
     }
 
     private boolean isAdjacentPx(float x1, float y1, float x2, float y2) {
@@ -855,11 +1250,20 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         else if (dir == GameEngine.DIR_DOWN) fy = 1f;
         else if (dir == GameEngine.DIR_LEFT) fx = -1f;
         else fx = 1f;
-
         float px = -fy;
         float py = fx;
 
-        // Flickering cute forked tongue when near food or periodically
+        // Glowing Shield energy ring around head when Shield is active!
+        if (engine.isShieldActive()) {
+            float pulseR = headR * (1.52f + 0.12f * (float) Math.sin(animTime * 7f));
+            fillPaint.setColor(withAlpha(palette.powerShield, 44));
+            canvas.drawCircle(hx, hy, pulseR, fillPaint);
+            strokePaint.setColor(palette.powerShield);
+            strokePaint.setStrokeWidth(dp(2.0f));
+            canvas.drawCircle(hx, hy, pulseR, strokePaint);
+        }
+
+        // Target food for eye tracking & tongue
         GameEngine.Cell target = engine.getBonusFood() != null ? engine.getBonusFood() : engine.getFood();
         boolean nearFood = false;
         float targetX = hx + fx * cellSize * 2f;
@@ -867,20 +1271,20 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         if (target != null) {
             targetX = boardLeft + (target.x + 0.5f) * cellSize;
             targetY = boardTop + (target.y + 0.5f) * cellSize;
-            float dist = (float) Math.hypot(targetX - hx, targetY - hy);
-            nearFood = dist < cellSize * 4.5f;
+            nearFood = Math.hypot(targetX - hx, targetY - hy) < cellSize * 4.5f;
         }
 
+        // Flickering forked tongue
         boolean showTongue = engine.getState() != GameEngine.STATE_GAME_OVER
                 && (nearFood || (animTime % 2.8f) < 0.35f);
         if (showTongue) {
             float extend = 0.65f + 0.35f * (float) Math.abs(Math.sin(animTime * 16f));
-            float tLen = headR * 0.95f * extend;
-            float tx0 = hx + fx * headR * 0.85f;
-            float ty0 = hy + fy * headR * 0.85f;
+            float tLen = headR * 0.96f * extend;
+            float tx0 = hx + fx * headR * 0.88f;
+            float ty0 = hy + fy * headR * 0.88f;
             float tx1 = tx0 + fx * tLen;
             float ty1 = ty0 + fy * tLen;
-            float fork = headR * 0.32f;
+            float fork = headR * 0.33f;
             strokePaint.setColor(palette.tongueColor);
             strokePaint.setStrokeWidth(Math.max(dp(1.4f), headR * 0.16f));
             strokePaint.setStrokeCap(Paint.Cap.ROUND);
@@ -891,28 +1295,46 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                     ty1 + (fy * 0.6f - py * 0.65f) * fork, strokePaint);
         }
 
-        // Eyes
-        float eyeOffFwd = headR * 0.25f;
+        // Subtle cute nostrils near snout tip
+        fillPaint.setColor(palette.snakeOutline);
+        for (int s = -1; s <= 1; s += 2) {
+            float nx = hx + fx * headR * 0.64f + px * headR * 0.20f * s;
+            float ny = hy + fy * headR * 0.64f + py * headR * 0.20f * s;
+            canvas.drawCircle(nx, ny, Math.max(1f, headR * 0.08f), fillPaint);
+        }
+
+        // Expressive eyes with periodic natural blink
+        float eyeOffFwd = headR * 0.20f;
         float eyeOffSide = headR * 0.46f;
-        float eyeR = headR * 0.33f;
-        boolean dead = (engine.getState() == GameEngine.STATE_GAME_OVER && !engine.isWonBoard());
+        float eyeR = headR * (nearFood ? 0.37f : 0.33f);
+        boolean dead = (engine.getState() == GameEngine.STATE_GAME_OVER
+                && !engine.isWonBoard() && !engine.isTimeExpired());
+        boolean blinking = !dead && !nearFood && (animTime % 4.3f) > 4.18f;
 
         for (int s = -1; s <= 1; s += 2) {
             float ex = hx + fx * eyeOffFwd + px * eyeOffSide * s;
             float ey = hy + fy * eyeOffFwd + py * eyeOffSide * s;
 
+            if (blinking) {
+                strokePaint.setColor(palette.snakeOutline);
+                strokePaint.setStrokeWidth(Math.max(dp(1.5f), eyeR * 0.35f));
+                canvas.drawLine(ex - px * eyeR * 0.55f, ey - py * eyeR * 0.55f,
+                        ex + px * eyeR * 0.55f, ey + py * eyeR * 0.55f, strokePaint);
+                continue;
+            }
+
+            fillPaint.setColor(palette.snakeOutline);
+            canvas.drawCircle(ex, ey, eyeR * 1.12f, fillPaint);
             fillPaint.setColor(0xFFFFFFFF);
             canvas.drawCircle(ex, ey, eyeR, fillPaint);
 
             if (dead) {
-                // Cute dizzy X eyes on crash
                 strokePaint.setColor(0xFF0F172A);
                 strokePaint.setStrokeWidth(Math.max(dp(1.3f), eyeR * 0.32f));
                 float xr = eyeR * 0.48f;
                 canvas.drawLine(ex - xr, ey - xr, ex + xr, ey + xr, strokePaint);
                 canvas.drawLine(ex - xr, ey + xr, ex + xr, ey - xr, strokePaint);
             } else {
-                // Pupil tracks food smoothly
                 float dx = targetX - ex;
                 float dy = targetY - ey;
                 float len = (float) Math.hypot(dx, dy);
@@ -924,7 +1346,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 fillPaint.setColor(0xFF0F172A);
                 canvas.drawCircle(pX, pY, pR, fillPaint);
                 fillPaint.setColor(0xEEFFFFFF);
-                canvas.drawCircle(pX - pR * 0.28f, pY - pR * 0.28f, pR * 0.32f, fillPaint);
+                canvas.drawCircle(pX - pR * 0.28f, pY - pR * 0.28f, pR * 0.34f, fillPaint);
             }
         }
     }
@@ -934,8 +1356,14 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             Particle p = particles[i];
             if (!p.active) continue;
             float a = Math.max(0f, p.life / p.maxLife);
-            fillPaint.setColor(withAlpha(p.color, (int) (255 * a)));
-            canvas.drawCircle(p.x, p.y, p.radius * (0.4f + 0.6f * a), fillPaint);
+            if (p.ring) {
+                strokePaint.setColor(withAlpha(p.color, (int) (185 * a)));
+                strokePaint.setStrokeWidth(dp(2.5f) * a + dp(0.6f));
+                canvas.drawCircle(p.x, p.y, p.radius, strokePaint);
+            } else {
+                fillPaint.setColor(withAlpha(p.color, (int) (255 * a)));
+                canvas.drawCircle(p.x, p.y, p.radius * (0.4f + 0.6f * a), fillPaint);
+            }
         }
     }
 
@@ -945,7 +1373,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             if (!ft.active) continue;
             float a = Math.max(0f, ft.life / ft.maxLife);
             textPaint.setTextSize(ft.big ? dp(15.5f) : dp(14f));
-            textPaint.setColor(withAlpha(0xFF000000, (int) (140 * a)));
+            textPaint.setColor(withAlpha(0xFF000000, (int) (150 * a)));
             canvas.drawText(ft.text, ft.x + dp(1), ft.y + dp(1.5f), textPaint);
             textPaint.setColor(withAlpha(ft.color, (int) (255 * a)));
             canvas.drawText(ft.text, ft.x, ft.y, textPaint);
@@ -1000,13 +1428,13 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     // --- Overlays ---
 
     private void drawScrim(Canvas canvas) {
-        fillPaint.setColor(withAlpha(0xFF040812, (int) (175 * overlayAlpha)));
+        fillPaint.setColor(withAlpha(0xFF030712, (int) (182 * overlayAlpha)));
         canvas.drawRect(0, 0, viewW, viewH, fillPaint);
     }
 
     private void drawModalCard(Canvas canvas, RectF card) {
         float rad = dp(24);
-        fillPaint.setColor(withAlpha(palette.cardBg, (int) (244 * overlayAlpha)));
+        fillPaint.setColor(withAlpha(palette.cardBg, (int) (246 * overlayAlpha)));
         canvas.drawRoundRect(card, rad, rad, fillPaint);
         strokePaint.setColor(withAlpha(palette.cardBorder, (int) (255 * overlayAlpha)));
         strokePaint.setStrokeWidth(dp(1.8f));
@@ -1016,9 +1444,9 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     private void drawMenuOverlay(Canvas canvas) {
         drawScrim(canvas);
 
-        float pad = dp(18);
+        float pad = dp(16);
         float w = modalRect.width();
-        float h = Math.min(modalRect.height(), dp(516));
+        float h = modalRect.height();
         float l = modalRect.left;
         float t = (viewH - h) * 0.5f;
         tempRect.set(l, t, l + w, t + h);
@@ -1027,45 +1455,63 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         float cx = tempRect.centerX();
         float innerL = tempRect.left + pad;
         float innerW = w - pad * 2f;
-        float y = tempRect.top + h * 0.065f;
+        float y = tempRect.top + h * 0.042f;
 
         // Animated snake emblem at top
-        drawMenuEmblem(canvas, cx, y + dp(14), dp(22));
-        y += dp(44);
+        drawMenuEmblem(canvas, cx, y + dp(12), dp(20));
+        y += dp(38);
 
         // Title & Subtitle
         textPaint.setColor(palette.textPrimary);
-        textPaint.setTextSize(dp(26f));
-        canvas.drawText(Strings.title(persian), cx, y + dp(12), textPaint);
-        y += dp(28);
+        textPaint.setTextSize(dp(23.5f));
+        canvas.drawText(Strings.title(persian), cx, y + dp(10), textPaint);
+        y += dp(25);
 
-        textPaint.setColor(palette.textSecondary);
-        textPaint.setTextSize(dp(12.5f));
-        canvas.drawText(Strings.subtitle(persian), cx, y + dp(6), textPaint);
-        y += dp(22);
-
-        float rowH = Math.min(dp(38), h * 0.074f);
-        float secGap = Math.min(dp(14), h * 0.025f);
-        float labelH = dp(17);
-
-        // Mode Section
         textPaint.setColor(palette.textSecondary);
         textPaint.setTextSize(dp(11.5f));
-        canvas.drawText(Strings.modeSection(persian), cx, y + dp(10), textPaint);
+        canvas.drawText(Strings.subtitle(persian), cx, y + dp(4), textPaint);
+        y += dp(18);
+
+        float rowH = Math.min(dp(35), h * 0.065f);
+        float secGap = Math.min(dp(11), h * 0.019f);
+        float labelH = dp(15);
+
+        // Mode Section (6 modes in clean 3x2 grid!)
+        textPaint.setColor(palette.textSecondary);
+        textPaint.setTextSize(dp(11f));
+        canvas.drawText(Strings.modeSection(persian), cx, y + dp(9), textPaint);
         y += labelH;
-        drawSegmentedRow(canvas, innerL, y, innerW, rowH, btnModeRects,
-                new String[]{
-                        Strings.modeName(0, persian),
-                        Strings.modeName(1, persian),
-                        Strings.modeName(2, persian)
-                },
-                engine.getMode(), null);
-        y += rowH + secGap;
+
+        float modeGap = dp(6);
+        float modeItemW = (innerW - modeGap * 2f) / 3f;
+        for (int row = 0; row < 2; row++) {
+            for (int col = 0; col < 3; col++) {
+                int mIdx = row * 3 + col;
+                float il = innerL + col * (modeItemW + modeGap);
+                float it = y + row * (rowH + modeGap);
+                btnModeRects[mIdx].set(il, it, il + modeItemW, it + rowH);
+                boolean sel = (mIdx == engine.getMode());
+                int bg = sel ? palette.pillSelectedBg : palette.pillBg;
+                int fg = sel
+                        ? (palette.darkIconsOnAccent ? 0xFF0A140A : 0xFFFFFFFF)
+                        : palette.textPrimary;
+                int border = sel ? palette.accent : palette.boardBorder;
+                drawPillButtonShifted(canvas, btnModeRects[mIdx], Strings.modeName(mIdx, persian),
+                        bg, fg, dp(11.8f), border, 0f);
+            }
+        }
+        y += rowH * 2f + modeGap + dp(5);
+
+        // Live 1-line description of selected mode
+        textPaint.setColor(palette.accent);
+        textPaint.setTextSize(dp(10.8f));
+        canvas.drawText(Strings.modeDescription(engine.getMode(), persian), cx, y + dp(10), textPaint);
+        y += dp(16) + secGap * 0.6f;
 
         // Speed Section
         textPaint.setColor(palette.textSecondary);
-        textPaint.setTextSize(dp(11.5f));
-        canvas.drawText(Strings.speedSection(persian), cx, y + dp(10), textPaint);
+        textPaint.setTextSize(dp(11f));
+        canvas.drawText(Strings.speedSection(persian), cx, y + dp(9), textPaint);
         y += labelH;
         drawSegmentedRow(canvas, innerL, y, innerW, rowH, btnSpeedRects,
                 new String[]{
@@ -1076,47 +1522,52 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 engine.getSpeedLevel(), null);
         y += rowH + secGap;
 
-        // Theme Section
+        // Theme Section (4 themes!)
         textPaint.setColor(palette.textSecondary);
-        textPaint.setTextSize(dp(11.5f));
-        canvas.drawText(Strings.themeSection(persian), cx, y + dp(10), textPaint);
+        textPaint.setTextSize(dp(11f));
+        canvas.drawText(Strings.themeSection(persian), cx, y + dp(9), textPaint);
         y += labelH;
-        int[] swatches = new int[]{ThemePalette.NEON.accent, ThemePalette.RETRO.cellLight, ThemePalette.SUNSET.accent};
+        int[] swatches = new int[]{
+                ThemePalette.NEON.accent,
+                ThemePalette.JUNGLE.snakeHead,
+                ThemePalette.SUNSET.accent,
+                ThemePalette.RETRO.cellLight
+        };
         drawSegmentedRow(canvas, innerL, y, innerW, rowH, btnThemeRects,
                 new String[]{
                         Strings.themeName(0, persian),
                         Strings.themeName(1, persian),
-                        Strings.themeName(2, persian)
+                        Strings.themeName(2, persian),
+                        Strings.themeName(3, persian)
                 },
                 palette.id, swatches);
         y += rowH + secGap;
 
         // Quick Toggles Row (D-Pad + Language)
-        float halfGap = dp(8);
-        float dpadW = innerW * 0.62f - halfGap * 0.5f;
+        float halfGap = dp(7);
+        float dpadW = innerW * 0.61f - halfGap * 0.5f;
         btnDpadToggleRect.set(innerL, y, innerL + dpadW, y + rowH);
         btnLangToggleRect.set(btnDpadToggleRect.right + halfGap, y, innerL + innerW, y + rowH);
         drawPillButton(canvas, btnDpadToggleRect, Strings.dpadToggle(showDpad, persian),
-                palette.pillBg, palette.textPrimary, dp(12f), palette.boardBorder);
+                palette.pillBg, palette.textPrimary, dp(11.5f), palette.boardBorder);
         drawPillButton(canvas, btnLangToggleRect, Strings.langToggle(persian),
-                palette.pillBg, palette.textPrimary, dp(12f), palette.boardBorder);
+                palette.pillBg, palette.textPrimary, dp(11.5f), palette.boardBorder);
         y += rowH + secGap;
 
         // Current Mode Best Score strip
         int best = engine.getCurrentBestScore();
         textPaint.setColor(palette.bonusBody);
-        textPaint.setTextSize(dp(13.5f));
+        textPaint.setTextSize(dp(12.8f));
         String bestStr = Strings.bestLabel(persian) + " (" + Strings.modeName(engine.getMode(), persian)
                 + "): " + Strings.num(best, persian);
-        canvas.drawText(bestStr, cx, y + dp(12), textPaint);
+        canvas.drawText(bestStr, cx, y + dp(10), textPaint);
 
         // Big Play Button pinned cleanly near bottom of card
-        float playH = Math.min(dp(50), h * 0.102f);
+        float playH = Math.min(dp(48), h * 0.092f);
         float playTop = tempRect.bottom - pad - playH;
         btnPrimaryRect.set(innerL, playTop, innerL + innerW, playTop + playH);
-        drawAccentButton(canvas, btnPrimaryRect, Strings.play(persian), dp(17.5f));
+        drawAccentButton(canvas, btnPrimaryRect, Strings.play(persian), dp(17f));
 
-        // Clear unused rects
         btnSecondaryRect.setEmpty();
         btnTertiaryRect.setEmpty();
     }
@@ -1174,14 +1625,23 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         float innerW = w - pad * 2f;
         float y = tempRect.top + dp(46);
 
-        // Title
-        textPaint.setColor(engine.isWonBoard() ? palette.bonusBody : palette.foodBody);
+        String overTitle;
+        int overColor;
+        if (engine.isWonBoard()) {
+            overTitle = Strings.youWin(persian);
+            overColor = palette.bonusBody;
+        } else if (engine.isTimeExpired()) {
+            overTitle = Strings.timeUp(persian);
+            overColor = palette.accent;
+        } else {
+            overTitle = Strings.gameOver(persian);
+            overColor = palette.foodBody;
+        }
+        textPaint.setColor(overColor);
         textPaint.setTextSize(dp(25f));
-        canvas.drawText(engine.isWonBoard() ? Strings.youWin(persian) : Strings.gameOver(persian),
-                cx, y, textPaint);
+        canvas.drawText(overTitle, cx, y, textPaint);
         y += dp(14);
 
-        // New Record Banner (if beaten!)
         if (engine.isNewBestThisRun()) {
             float badgeW = dp(164);
             float badgeH = dp(28);
@@ -1201,7 +1661,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             y += dp(16);
         }
 
-        // 2x2 Stats Grid
         float statGap = dp(10);
         float statW = (innerW - statGap) * 0.5f;
         float statH = dp(58);
@@ -1218,7 +1677,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 Strings.lengthLabel(persian), Strings.num(engine.getSnake().size(), persian), palette.snakeHead);
         y += statH + dp(20);
 
-        // Action Buttons
         float btnH = dp(48);
         btnPrimaryRect.set(innerL, y, innerL + innerW, y + btnH);
         drawAccentButton(canvas, btnPrimaryRect, Strings.playAgain(persian), dp(16.5f));
@@ -1251,8 +1709,9 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     private void drawSegmentedRow(Canvas canvas, float l, float t, float w, float h,
                                   RectF[] outRects, String[] labels, int selectedIndex, int[] swatches) {
         int count = labels.length;
-        float gap = dp(6);
+        float gap = dp(5);
         float itemW = (w - gap * (count - 1)) / count;
+        float fontSz = (count >= 4) ? dp(11.0f) : dp(12.0f);
         for (int i = 0; i < count; i++) {
             float il = l + i * (itemW + gap);
             outRects[i].set(il, t, il + itemW, t + h);
@@ -1262,12 +1721,12 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                     ? (palette.darkIconsOnAccent ? 0xFF0A140A : 0xFFFFFFFF)
                     : palette.textPrimary;
             int border = sel ? palette.accent : palette.boardBorder;
-            float textShift = (swatches != null) ? dp(5.5f) : 0f;
-            drawPillButtonShifted(canvas, outRects[i], labels[i], bg, fg, dp(12.2f), border, textShift);
+            float textShift = (swatches != null) ? dp(5.0f) : 0f;
+            drawPillButtonShifted(canvas, outRects[i], labels[i], bg, fg, fontSz, border, textShift);
             if (swatches != null && i < swatches.length) {
-                float sx = outRects[i].left + dp(11);
+                float sx = outRects[i].left + dp(9.5f);
                 float sy = outRects[i].centerY();
-                float sr = dp(4.2f);
+                float sr = dp(3.8f);
                 fillPaint.setColor(swatches[i]);
                 canvas.drawCircle(sx, sy, sr, fillPaint);
                 strokePaint.setColor(0xDDFFFFFF);
@@ -1285,7 +1744,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     private void drawPillButtonShifted(Canvas canvas, RectF rect, String label,
                                        int bgColor, int textColor, float textSize,
                                        int borderColor, float textOffsetX) {
-        float r = dp(12);
+        float r = dp(11);
         fillPaint.setColor(bgColor);
         canvas.drawRoundRect(rect, r, r, fillPaint);
         strokePaint.setColor(borderColor);
@@ -1306,7 +1765,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         canvas.drawRoundRect(rect, r, r, fillPaint);
         fillPaint.setShader(null);
 
-        // Subtle top gloss highlight
         fillPaint.setColor(0x28FFFFFF);
         canvas.drawRoundRect(rect.left + dp(3), rect.top + dp(2),
                 rect.right - dp(3), rect.centerY(), r, r, fillPaint);
@@ -1319,24 +1777,21 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
     }
 
     private void drawMenuEmblem(Canvas canvas, float cx, float cy, float r) {
-        // Soft radial aura
         fillPaint.setColor(withAlpha(palette.accent, 38));
         canvas.drawCircle(cx, cy, r * 1.45f, fillPaint);
 
-        // Mini sinuous animated snake wave
-        int segs = 9;
+        int segs = 10;
         for (int i = segs - 1; i >= 0; i--) {
             float t = i / (float) (segs - 1);
-            float sx = cx + (0.5f - t) * r * 2.1f;
-            float sy = cy + (float) Math.sin(animTime * 4.0f - i * 0.7f) * r * 0.28f;
-            float sr = r * (0.28f + 0.16f * (1f - t));
+            float sx = cx + (0.5f - t) * r * 2.2f;
+            float sy = cy + (float) Math.sin(animTime * 4.2f - i * 0.65f) * r * 0.28f;
+            float sr = r * (0.26f + 0.17f * (1f - t));
             int col = ThemePalette.lerpColor(palette.snakeHead, palette.snakeTail, t);
             fillPaint.setColor(palette.snakeOutline);
             canvas.drawCircle(sx, sy, sr + dp(1.5f), fillPaint);
             fillPaint.setColor(col);
             canvas.drawCircle(sx, sy, sr, fillPaint);
             if (i == 0) {
-                // Eyes on head
                 fillPaint.setColor(0xFFFFFFFF);
                 canvas.drawCircle(sx + sr * 0.25f, sy - sr * 0.35f, sr * 0.28f, fillPaint);
                 canvas.drawCircle(sx + sr * 0.25f, sy + sr * 0.35f, sr * 0.28f, fillPaint);
@@ -1399,7 +1854,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
 
     private void drawMiniTrophy(Canvas canvas, float cx, float cy, float r, int color) {
         fillPaint.setColor(color);
-        // Cup bowl
         iconPath.reset();
         iconPath.moveTo(cx - r * 0.72f, cy - r * 0.72f);
         iconPath.lineTo(cx + r * 0.72f, cy - r * 0.72f);
@@ -1407,7 +1861,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         iconPath.quadTo(cx - r * 0.65f, cy + r * 0.18f, cx - r * 0.72f, cy - r * 0.72f);
         iconPath.close();
         canvas.drawPath(iconPath, fillPaint);
-        // Stem + Base
         canvas.drawRect(cx - r * 0.16f, cy + r * 0.20f, cx + r * 0.16f, cy + r * 0.62f, fillPaint);
         canvas.drawRoundRect(cx - r * 0.55f, cy + r * 0.55f, cx + r * 0.55f, cy + r * 0.82f, dp(1.5f), dp(1.5f), fillPaint);
     }
@@ -1430,7 +1883,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
         int st = engine.getState();
 
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
-            // 1. Always check HUD Sound button
             if (hit(btnSoundRect, x, y, dp(6))) {
                 sound.setMuted(!sound.isMuted());
                 if (!sound.isMuted()) sound.play(SoundEngine.SND_BUTTON);
@@ -1439,7 +1891,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 return true;
             }
 
-            // 2. HUD Pause button (during PLAYING or PAUSED)
             if ((st == GameEngine.STATE_PLAYING || st == GameEngine.STATE_PAUSED)
                     && hit(btnPauseRect, x, y, dp(6))) {
                 sound.play(SoundEngine.SND_BUTTON);
@@ -1453,7 +1904,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 return true;
             }
 
-            // 3. Overlay clicks
             if (st == GameEngine.STATE_MENU) {
                 return handleMenuTouch(x, y);
             } else if (st == GameEngine.STATE_PAUSED) {
@@ -1462,7 +1912,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 return handleGameOverTouch(x, y);
             }
 
-            // 4. Gameplay: D-Pad press first
             if (showDpad) {
                 for (int dir = 0; dir < 4; dir++) {
                     if (hit(dpadRects[dir], x, y, dp(8))) {
@@ -1475,7 +1924,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 }
             }
 
-            // 5. Gameplay: Start swipe gesture anywhere else
             if (swipePointerId == -1) {
                 swipePointerId = pid;
                 swipeStartX = x;
@@ -1500,7 +1948,6 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                         if (engine.queueDirection(dir)) {
                             performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                         }
-                        // Reset anchor for continuous drag steering
                         swipeStartX = cx;
                         swipeStartY = cy;
                     }
@@ -1529,23 +1976,28 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             engine.startGame();
             return true;
         }
-        for (int i = 0; i < 3; i++) {
-            if (hit(btnModeRects[i], x, y, dp(3))) {
+        for (int i = 0; i < btnModeRects.length; i++) {
+            if (hit(btnModeRects[i], x, y, dp(2))) {
                 engine.setMode(i);
                 sound.play(SoundEngine.SND_BUTTON);
                 performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 savePrefs();
                 return true;
             }
-            if (hit(btnSpeedRects[i], x, y, dp(3))) {
+        }
+        for (int i = 0; i < btnSpeedRects.length; i++) {
+            if (hit(btnSpeedRects[i], x, y, dp(2))) {
                 engine.setSpeedLevel(i);
                 sound.play(SoundEngine.SND_BUTTON);
                 performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 savePrefs();
                 return true;
             }
-            if (hit(btnThemeRects[i], x, y, dp(3))) {
+        }
+        for (int i = 0; i < btnThemeRects.length; i++) {
+            if (hit(btnThemeRects[i], x, y, dp(2))) {
                 palette = ThemePalette.byId(i);
+                cachedBgGradient = null;
                 if (themeCallback != null) themeCallback.onThemeChanged(palette.bgOuter);
                 sound.play(SoundEngine.SND_BUTTON);
                 performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
@@ -1553,7 +2005,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
                 return true;
             }
         }
-        if (hit(btnDpadToggleRect, x, y, dp(3))) {
+        if (hit(btnDpadToggleRect, x, y, dp(2))) {
             showDpad = !showDpad;
             computeLayout(viewW, viewH);
             sound.play(SoundEngine.SND_BUTTON);
@@ -1561,7 +2013,7 @@ public final class SnakeGameView extends View implements GameEngine.Listener {
             savePrefs();
             return true;
         }
-        if (hit(btnLangToggleRect, x, y, dp(3))) {
+        if (hit(btnLangToggleRect, x, y, dp(2))) {
             persian = !persian;
             sound.play(SoundEngine.SND_BUTTON);
             performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);

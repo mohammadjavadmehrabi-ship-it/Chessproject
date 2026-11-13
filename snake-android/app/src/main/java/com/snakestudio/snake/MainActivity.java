@@ -8,10 +8,13 @@ import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowManager;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 
 public final class MainActivity extends Activity {
 
     private SnakeGameView gameView;
+    private Object backCallbackHandle;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -35,8 +38,12 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 30) {
             Api30InsetsHelper.enableEdgeToEdge(win, gameView);
         }
+        if (Build.VERSION.SDK_INT >= 33) {
+            backCallbackHandle = Api33BackHelper.register(this, gameView);
+        }
     }
 
+    @SuppressWarnings("deprecation")
     private void applySystemBarColors(int bgColor) {
         Window win = getWindow();
         if (win == null) return;
@@ -59,6 +66,10 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (Build.VERSION.SDK_INT >= 33 && backCallbackHandle != null) {
+            Api33BackHelper.unregister(this, backCallbackHandle);
+            backCallbackHandle = null;
+        }
         if (gameView != null) {
             gameView.onHostDestroy();
         }
@@ -78,6 +89,7 @@ public final class MainActivity extends Activity {
      * Isolated API 30+ helper so API 21-29 runtimes never load android.graphics.Insets.
      */
     private static final class Api30InsetsHelper {
+        @SuppressWarnings("deprecation")
         static void enableEdgeToEdge(Window win, final SnakeGameView view) {
             win.setDecorFitsSystemWindows(false);
             view.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
@@ -90,6 +102,32 @@ public final class MainActivity extends Activity {
                 }
             });
             view.requestApplyInsets();
+        }
+    }
+
+    /**
+     * Isolated API 33+ helper for Android 13-15 Predictive Back support.
+     */
+    private static final class Api33BackHelper {
+        static Object register(final Activity activity, final SnakeGameView view) {
+            OnBackInvokedCallback cb = new OnBackInvokedCallback() {
+                @Override
+                public void onBackInvoked() {
+                    if (!view.handleBackPressed()) {
+                        activity.finish();
+                    }
+                }
+            };
+            activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb);
+            return cb;
+        }
+
+        static void unregister(Activity activity, Object handle) {
+            if (handle instanceof OnBackInvokedCallback) {
+                activity.getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(
+                        (OnBackInvokedCallback) handle);
+            }
         }
     }
 }
